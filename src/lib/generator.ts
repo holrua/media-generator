@@ -19,6 +19,7 @@ import {
   type ApiKeyRow,
 } from "./keys";
 import { getTask, insertTask, updateTask, type TaskRow } from "./tasks";
+import { refreshMergeTask } from "./merger";
 
 export const adapters: Record<"kie" | "cometapi", ProviderAdapter> = {
   kie: kieAdapter,
@@ -288,6 +289,10 @@ export async function refreshTask(taskId: string, signal?: AbortSignal): Promise
   const task = await getTask(taskId);
   if (!task) return null;
   if (task.status === "completed" || task.status === "failed") return task;
+
+  // مهام الدمج: تُتابَع لدى خدمة Video Merger (بلا مفاتيح)
+  if (task.provider === "merger") return refreshMergeTask(task);
+
   if (!task.provider || !task.providerTaskId || task.providerTaskId.startsWith("sync-")) return task;
 
   const key = task.keyId ? await getKey(task.keyId) : null;
@@ -318,9 +323,9 @@ export async function refreshTask(taskId: string, signal?: AbortSignal): Promise
 /** تنسيق المهمة كنص للعميل (يُعرض داخل الدردشة ويوجه النموذج للخطوة التالية) */
 export function renderTaskForClient(task: TaskRow, opts: { forTool?: "get_task" | "generation" } = {}): string {
   const lines: string[] = [];
-  const typeAr = task.type === "image" ? "صورة" : "فيديو";
+  const labelEn = task.type === "image" ? "Image" : task.type === "merge" ? "Merged video" : "Video";
   if (task.status === "completed") {
-    lines.push(`✅ ${typeAr === "صورة" ? "Image ready" : "Video ready"}! (task_id: ${task.id})`);
+    lines.push(`✅ ${labelEn} ready! (task_id: ${task.id})`);
     for (const url of task.resultUrls) {
       if (task.type === "image") lines.push(`![generated image](${url})`);
       else lines.push(`▶️ [Watch / download the video](${url})`);
@@ -330,18 +335,22 @@ export function renderTaskForClient(task: TaskRow, opts: { forTool?: "get_task" 
     return lines.join("\n");
   }
   if (task.status === "failed") {
-    lines.push(`❌ ${typeAr === "صورة" ? "Image" : "Video"} generation FAILED (task_id: ${task.id})`);
+    lines.push(`❌ ${labelEn} generation FAILED (task_id: ${task.id})`);
     if (task.errorMessage) lines.push(`reason: ${task.errorMessage}`);
     const fails = task.attempts.filter((a) => !a.ok);
     if (fails.length) {
       lines.push("attempts:");
       for (const a of fails) lines.push(`- [${a.provider}] (${a.errorClass}) ${a.error}`);
     }
-    lines.push(`أخبر المستخدم بالتفاصيل أعلاه. ملاحظة: مفاتيح خلص رصيدها تُنشَّط من الواجهة بعد الشحن.`);
+    lines.push(
+      task.type === "merge"
+        ? `أخبر المستخدم بالتفاصيل أعلاه.`
+        : `أخبر المستخدم بالتفاصيل أعلاه. ملاحظة: مفاتيح خلص رصيدها تُنشَّط من الواجهة بعد الشحن.`
+    );
     return lines.join("\n");
   }
   // pending / processing
-  lines.push(`⏳ ${typeAr === "صورة" ? "Image" : "Video"} task is ${task.status.toUpperCase()} (task_id: ${task.id})`);
+  lines.push(`⏳ ${labelEn} task is ${task.status.toUpperCase()} (task_id: ${task.id})`);
   lines.push(`provider: ${task.provider ?? "?"} — model: ${task.model} — progress: ${task.progress}%`);
   lines.push(`➡️ Call get_task with task_id="${task.id}" every ~10 seconds until status becomes "completed", then show the result URL to the user and stop polling.`);
   return lines.join("\n");

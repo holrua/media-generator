@@ -1,7 +1,9 @@
 /** سجل الموديلات المدمجة — يربط اسم الموديل الموحّد بالمزودين القادرين على خدمته */
 
 export type ProviderId = "kie" | "cometapi";
-export type MediaType = "image" | "video";
+/** مزودو التوليد + مزود الدمج (خدمة Video Merger — بلا مفاتيح) */
+export type TaskProvider = ProviderId | "merger";
+export type MediaType = "image" | "video" | "merge";
 
 export interface ModelDef {
   /** الاسم الموحّد كما يراه عميل MCP */
@@ -53,6 +55,11 @@ export function findModel(name: string | undefined | null): ModelDef | null {
 export const PROVIDER_LABELS: Record<ProviderId, string> = {
   kie: "kie.ai",
   cometapi: "CometAPI",
+};
+
+export const PROVIDER_LABELS_ALL: Record<TaskProvider, string> = {
+  ...PROVIDER_LABELS,
+  merger: "Video Merger",
 };
 
 export const PROVIDER_DOCS: Record<ProviderId, string> = {

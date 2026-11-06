@@ -36,10 +36,10 @@ export interface KeysResponse {
 
 export interface TaskItem {
   id: string;
-  provider: "kie" | "cometapi" | null;
+  provider: "kie" | "cometapi" | "merger" | null;
   providerTaskId: string | null;
   model: string;
-  type: "image" | "video";
+  type: "image" | "video" | "merge";
   prompt: string;
   status: TaskStatus;
   progress: number;
@@ -61,5 +61,6 @@ export interface HealthResponse {
   database: string;
   mcpEndpoint: string;
   models: Array<{ canonical: string; type: "image" | "video"; providers: string[] }>;
+  merger: { base: string; healthy: boolean };
   authRequired: boolean;
 }

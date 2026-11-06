@@ -4,7 +4,7 @@
  */
 import { randomUUID } from "crypto";
 import { ensureSchema, getTurso } from "./turso";
-import type { MediaType, ProviderId } from "./models";
+import type { MediaType, ProviderId, TaskProvider } from "./models";
 
 export type TaskStatus = "pending" | "processing" | "completed" | "failed";
 
@@ -20,7 +20,7 @@ export interface TaskAttempt {
 
 export interface TaskRow {
   id: string;
-  provider: ProviderId | null;
+  provider: TaskProvider | null;
   providerTaskId: string | null;
   keyId: string | null;
   model: string;
@@ -50,7 +50,7 @@ function toRow(r: Record<string, unknown>): TaskRow {
   } catch { /* تجاهل */ }
   return {
     id: String(r.id),
-    provider: (r.provider as ProviderId) ?? null,
+    provider: (r.provider as TaskProvider) ?? null,
     providerTaskId: (r.provider_task_id as string) ?? null,
     keyId: (r.key_id as string) ?? null,
     model: String(r.model),
@@ -69,7 +69,7 @@ function toRow(r: Record<string, unknown>): TaskRow {
 }
 
 export async function insertTask(t: {
-  provider: ProviderId | null;
+  provider: TaskProvider | null;
   providerTaskId: string | null;
   keyId: string | null;
   model: string;
@@ -119,7 +119,7 @@ export async function updateTask(
     progress: number;
     resultUrls: string[];
     errorMessage: string | null;
-    provider: ProviderId;
+    provider: TaskProvider;
     providerTaskId: string;
     keyId: string;
     appendAttempt: TaskAttempt;

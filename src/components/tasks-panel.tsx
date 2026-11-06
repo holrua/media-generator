@@ -1,6 +1,6 @@
 "use client";
 
-import { Database, ExternalLink, ImageIcon, Video } from "lucide-react";
+import { Database, ExternalLink, ImageIcon, Video, Merge } from "lucide-react";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { ScrollArea } from "@/components/ui/scroll-area";
@@ -61,6 +61,8 @@ export function TasksPanel({ data, loading }: { data: TasksResponse | null; load
                     <div className="flex min-w-0 items-center gap-2">
                       {t.type === "image" ? (
                         <ImageIcon className="size-4 shrink-0 text-emerald-400" />
+                      ) : t.type === "merge" ? (
+                        <Merge className="size-4 shrink-0 text-sky-400" />
                       ) : (
                         <Video className="size-4 shrink-0 text-violet-300" />
                       )}

@@ -12,6 +12,7 @@ import type { HealthResponse } from "@/lib/client-types";
 const TOOL_CHIPS: Array<{ name: string; desc: string }> = [
   { name: "generate_image", desc: "توليد صورة — gpt-image-2-6/flare-text-to-image" },
   { name: "generate_video", desc: "توليد فيديو — grok-imagine-video-1-5-preview" },
+  { name: "merge_videos", desc: "دمج عدة فيديوهات في مقطع واحد — بروابط أو task_ids" },
   { name: "get_task", desc: "متابعة حالة المهمة من قاعدة البيانات (كل ~10 ثوانٍ)" },
   { name: "list_media", desc: "جلب أحدث الروابط المخزنة في قاعدة البيانات" },
 ];

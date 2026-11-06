@@ -27,10 +27,10 @@ async function main() {
       timeout: 60_000,
     }
   );
-  console.log("3) get_task → isError:", result.isError, "| text:", result.content[0].text.slice(0, 80));
+  console.log("3) get_task → isError:", result.isError, "| text:", (result.content as Array<{ text: string }>)[0].text.slice(0, 80));
 
   const listing = await client.callTool({ name: "list_media", arguments: { limit: 3 } });
-  console.log("4) list_media →", listing.content[0].text.split("\n")[0]);
+  console.log("4) list_media →", (listing.content as Array<{ text: string }>)[0].text.split("\n")[0]);
 
   await client.close();
   console.log("5) CLOSED CLEANLY");

@@ -1,13 +1,15 @@
 /**
- * أدوات MCP الأربع:
+ * أدوات MCP الخمسة:
  * - generate_image : توليد صورة (gpt-image-2-6/flare-text-to-image)
  * - generate_video : توليد فيديو (grok-imagine-video-1-5-preview)
+ * - merge_videos   : دمج عدة فيديوهات في مقطع واحد (خدمة Video Merger)
  * - get_task       : متابعة حالة أي مهمة من قاعدة البيانات (استعلام كل ~10 ثوانٍ)
  * - list_media     : جلب أحدث الروابط المخزنة في قاعدة البيانات
  */
 import { MODELS } from "../models";
 import { runGeneration, refreshTask, renderTaskForClient, type ProgressCb } from "../generator";
-import { listRecentTasks } from "../tasks";
+import { runMerge } from "../merger";
+import { getTask, listRecentTasks } from "../tasks";
 
 export interface ToolDef {
   name: string;
@@ -87,15 +89,54 @@ export const TOOLS: ToolDef[] = [
     },
   },
   {
-    name: "get_task",
-    title: "Get task status",
+    name: "merge_videos",
+    title: "Merge videos",
     description:
-      "Track any generation task by its task_id (reads the shared Turso database, refreshing from the provider when still running). " +
-      "Poll it every ~10 seconds after generate_image / generate_video returns a task_id. When status is completed the result URLs are included — display them to the user and stop polling.",
+      "Concatenate several video clips into ONE final high-quality video, in the exact order given. " +
+      "Provide 'urls' (public direct video links — e.g. the URLs returned by generate_video) OR 'task_ids' " +
+      "(task_ids of completed video tasks; their stored URLs are resolved in order — perfect right after generating multiple clips). " +
+      "Merging is usually fast: the tool waits briefly (streaming progress), then returns a merge task_id — " +
+      "call get_task with it every ~10 seconds until status is completed, then show the merged video URL and stop.",
     inputSchema: {
       type: "object",
       properties: {
-        task_id: { type: "string", description: "The task_id returned by generate_image / generate_video." },
+        urls: {
+          type: "array",
+          items: { type: "string" },
+          minItems: 2,
+          maxItems: 20,
+          description: "Public direct video URLs (http/https) in merge order — the first clip starts the final video.",
+        },
+        task_ids: {
+          type: "array",
+          items: { type: "string" },
+          minItems: 2,
+          maxItems: 20,
+          description:
+            "Alternative to urls: task_ids of COMPLETED video generation tasks — their result URLs are merged in this order.",
+        },
+        resolution: { type: "string", enum: ["480p", "720p", "1080p"], default: "1080p", description: "Output resolution of the merged video." },
+        fps: { type: "integer", minimum: 24, maximum: 60, default: 30, description: "Frames per second of the merged video." },
+        wait_seconds: {
+          type: "integer",
+          minimum: 0,
+          maximum: 240,
+          default: 60,
+          description: "Wait inline (streaming progress) for the merge to finish. Otherwise a merge task_id is returned for get_task polling.",
+        },
+      },
+    },
+  },
+  {
+    name: "get_task",
+    title: "Get task status",
+    description:
+      "Track any task by its task_id — image/video generation AND video merging (reads the shared Turso database, refreshing from the provider/service when still running). " +
+      "Poll it every ~10 seconds after generate_image / generate_video / merge_videos returns a task_id. When status is completed the result URLs are included — display them to the user and stop polling.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        task_id: { type: "string", description: "The task_id returned by generate_image / generate_video / merge_videos." },
       },
       required: ["task_id"],
     },
@@ -104,11 +145,11 @@ export const TOOLS: ToolDef[] = [
     name: "list_media",
     title: "List stored media",
     description:
-      "List recently generated images/videos with their stored URLs from the database (no re-generation). Useful to recall previous results by task_id.",
+      "List recently generated images/videos and merged outputs with their stored URLs from the database (no re-generation). Useful to recall previous results by task_id.",
     inputSchema: {
       type: "object",
       properties: {
-        type: { type: "string", enum: ["image", "video"], description: "Filter by media type." },
+        type: { type: "string", enum: ["image", "video", "merge"], description: "Filter by media type (merge = merged videos)." },
         status: { type: "string", enum: ["completed", "failed", "processing"], description: "Filter by task status." },
         limit: { type: "integer", minimum: 1, maximum: 50, default: 10 },
       },
@@ -181,6 +222,62 @@ export async function callTool(
     }
   }
 
+  if (name === "merge_videos") {
+    // 1) جمع الروابط: task_ids تُحلّ من قاعدة البيانات، ثم urls المباشرة تُلحق بالترتيب
+    const resolved: string[] = [];
+    const problems: string[] = [];
+    const taskIds = Array.isArray(args.task_ids) ? args.task_ids.map((t) => String(t).trim()).filter(Boolean) : [];
+    for (const tid of taskIds) {
+      const t = await getTask(tid);
+      if (!t) {
+        problems.push(`task_id ${tid}: غير موجود في قاعدة البيانات`);
+      } else if (t.status !== "completed" || t.resultUrls.length === 0) {
+        problems.push(`task_id ${tid}: الحالة ${t.status} — لا يوجد رابط جاهز للدمج بعد`);
+      } else {
+        resolved.push(...t.resultUrls);
+      }
+    }
+    const direct = Array.isArray(args.urls)
+      ? args.urls.map((u) => String(u).trim()).filter((u) => /^https?:\/\//i.test(u))
+      : [];
+    const badUrls = Array.isArray(args.urls)
+      ? args.urls.map((u) => String(u).trim()).filter((u) => u && !/^https?:\/\//i.test(u))
+      : [];
+    for (const u of badUrls) problems.push(`رابط غير صالح (يجب أن يكون http/https مباشرًا): ${u}`);
+
+    const urls = [...resolved, ...direct];
+    if (urls.length < 2) {
+      const detail = problems.length ? `\nتفاصيل:\n- ${problems.join("\n- ")}` : "";
+      return {
+        ...text(
+          `❌ الدمج يحتاج مقطعَين على الأقل. مرّر urls (روابط مباشرة) أو task_ids لمهام مكتملة.${detail}`
+        ),
+        isError: true,
+      };
+    }
+
+    // 2) تنفيذ الدمج عبر خدمة Video Merger (بلا مفاتيح API)
+    const outcome = await runMerge({
+      urls,
+      resolution: str(args.resolution) ?? "1080p",
+      fps: clamp(args.fps, 24, 60, 30),
+      waitSeconds: clamp(args.wait_seconds, 0, 240, 60),
+      onProgress: ctx.sendProgress,
+      signal: ctx.signal,
+    });
+
+    switch (outcome.kind) {
+      case "completed":
+        return text(renderTaskForClient(outcome.task));
+      case "processing":
+        return text(renderTaskForClient(outcome.task));
+      case "failed":
+        return { ...text(renderTaskForClient(outcome.task)), isError: true };
+      case "invalid":
+        return { ...text(`❌ ${outcome.reason}`), isError: true };
+    }
+  }
+
   if (name === "get_task") {
     const taskId = str(args.task_id);
     if (!taskId) return { ...text("❌ task_id مطلوب (required)"), isError: true };
@@ -190,7 +287,8 @@ export async function callTool(
   }
 
   if (name === "list_media") {
-    const type = str(args.type) === "image" || str(args.type) === "video" ? (str(args.type) as "image" | "video") : undefined;
+    const typeRaw = str(args.type);
+    const type = typeRaw === "image" || typeRaw === "video" || typeRaw === "merge" ? typeRaw : undefined;
     const status = str(args.status);
     const limit = clamp(args.limit, 1, 50, 10);
     const tasks = await listRecentTasks(limit, {
@@ -210,12 +308,13 @@ export async function callTool(
   return { ...text(`❌ أداة غير معروفة: ${name}. المتاح: ${TOOLS.map((t) => t.name).join(", ")}`), isError: true };
 }
 
-export const SERVER_INFO = { name: "media-generator-mcp", version: "1.0.0" } as const;
+export const SERVER_INFO = { name: "media-generator-mcp", version: "1.1.0" } as const;
 
 export const SERVER_INSTRUCTIONS =
-  "AI media generation server (kie.ai + CometAPI with automatic multi-key failover). " +
+  "AI media generation server (kie.ai + CometAPI with automatic multi-key failover, plus video merging). " +
   "Workflow: call generate_image or generate_video. If the response contains finished URLs, show them to the user. " +
   "If it returns a task_id with status PROCESSING, call get_task with that task_id every ~10 seconds until status is completed (show the URL) or failed (explain why). " +
+  "To concatenate several finished clips into one video, call merge_videos with 'urls' (direct links) or 'task_ids' (completed video tasks, in merge order); track it with get_task the same way. " +
   "Use list_media to recall previously generated media from the database.";
 
 export const SUPPORTED_MODELS_TEXT = MODELS.map((m) => `${m.canonical} (${m.type})`).join(", ");
