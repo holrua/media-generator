@@ -141,15 +141,17 @@ export interface KeyCandidate {
 }
 
 /**
- * يجمع المفاتيح النشطة القادرة على خدمة الموديل من المزودين المعنيين
+ * يجمع كل المفاتيح القادرة على خدمة الموديل من المزودين المعنيين
  * ويرتبها: الأقل استخدامًا أولًا (Round-robin عادل).
+ * سياسة «لا مفتاح يتوقف»: المفاتيح تبقى في الدورة دائمًا حتى مع نفاد الرصيد —
+ * الاستثناء الوحيد هو التعطيل اليدوي من الواجهة (status = 'disabled').
  */
 export async function getKeyPool(providers: ProviderId[]): Promise<ApiKeyRow[]> {
   await ensureSchema();
   const placeholders = providers.map(() => "?").join(",");
   const res = await getTurso().execute({
     sql: `SELECT * FROM api_keys
-          WHERE status = 'active' AND provider IN (${placeholders})
+          WHERE status != 'disabled' AND provider IN (${placeholders})
           ORDER BY usage_count ASC,
                    (last_used_at IS NULL) DESC,
                    last_used_at ASC,
@@ -167,7 +169,8 @@ export function classifyProviderError(err: unknown): { cls: ErrorClass; status: 
     const ml = m.toLowerCase();
     if (s === 401 || s === 403 || /invalid api key|invalid_api_key|unauthorized|forbidden|authentication|مفتاح غير صالح/.test(ml))
       return { cls: "disabled", status: s, message: m };
-    if (s === 402 || /insufficient|quota|exceeded|balance|credit|arrears|充值|out of credits/.test(ml))
+    // نفاد الرصيد/الحصة — قبل فحص المعطيات لأن بعض المزودين يرسلونه بحالة 400
+    if (s === 402 || /insufficient|quota|exceeded|balance|credit|arrears|充值|out of credits|exhausted|resource.?exhausted/.test(ml))
       return { cls: "exhausted", status: s, message: m };
     if (/model.*(not|un).*found|not.*support|unsupported model|unknown model/.test(ml) && (s === 400 || s === 404 || s === 422))
       return { cls: "provider", status: s, message: m };
@@ -183,9 +186,9 @@ export function classifyProviderError(err: unknown): { cls: ErrorClass; status: 
 }
 
 export const CLASS_MESSAGES: Record<ErrorClass, string> = {
-  disabled: "مفتاح غير صالح — عُطِّل تلقائيًا",
-  exhausted: "خلص رصيد المفتاح — وُسم exhausted",
-  temporary: "ضغط مؤقت أو خطأ شبكة/سيرفر — انتقال للمفتاح التالي",
+  disabled: "المفتاح مرفوض من المزود — انتقال تلقائي للمفتاح التالي",
+  exhausted: "المفتاح غير متاح حاليًا — انتقال تلقائي للمفتاح التالي",
+  temporary: "ضغط مؤقت أو خطأ شبكة/سيرفر — انتقال تلقائي للمفتاح التالي",
   params: "خطأ في معطيات الطلب — إيقاف فوري (التبديل لن يحلها)",
-  provider: "المزود لا يدعم هذا الموديل أو رفض الطلب — انتقال للتالي",
+  provider: "المزود لا يدعم هذا الموديل أو رفض الطلب — انتقال تلقائي للتالي",
 };

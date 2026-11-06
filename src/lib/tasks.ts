@@ -119,9 +119,9 @@ export async function updateTask(
     progress: number;
     resultUrls: string[];
     errorMessage: string | null;
-    provider: TaskProvider;
-    providerTaskId: string;
-    keyId: string;
+    provider: TaskProvider | null;
+    providerTaskId: string | null;
+    keyId: string | null;
     appendAttempt: TaskAttempt;
   }>
 ): Promise<TaskRow | null> {
@@ -132,12 +132,16 @@ export async function updateTask(
   const attempts = patch.appendAttempt ? [...current.attempts, patch.appendAttempt] : current.attempts;
   const urls = patch.resultUrls ?? current.resultUrls;
   const status = patch.status ?? current.status;
+  // الحقول القابلة للمسح صراحةً (null) أو الإبقاء على القيمة الحالية عند عدم تمريرها
+  const provider = patch.provider !== undefined ? patch.provider : current.provider;
+  const providerTaskId = patch.providerTaskId !== undefined ? patch.providerTaskId : current.providerTaskId;
+  const keyId = patch.keyId !== undefined ? patch.keyId : current.keyId;
 
   await getTurso().execute({
     sql: `UPDATE tasks SET
-            provider = COALESCE(?, provider),
-            provider_task_id = COALESCE(?, provider_task_id),
-            key_id = COALESCE(?, key_id),
+            provider = ?,
+            provider_task_id = ?,
+            key_id = ?,
             status = ?,
             progress = ?,
             result_urls_json = ?,
@@ -147,9 +151,9 @@ export async function updateTask(
             completed_at = CASE WHEN ? = 'completed' AND completed_at IS NULL THEN datetime('now') ELSE completed_at END
           WHERE id = ?`,
     args: [
-      patch.provider ?? null,
-      patch.providerTaskId ?? null,
-      patch.keyId ?? null,
+      provider,
+      providerTaskId,
+      keyId,
       status,
       patch.progress ?? current.progress,
       urls.length ? JSON.stringify(urls) : null,

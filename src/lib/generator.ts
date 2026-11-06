@@ -1,12 +1,19 @@
 /**
- * منسّق التوليد: يجمع المفاتيح النشطة (الأقل استخدامًا أولًا) ويجرّبها بالترتيب،
- * ويصنّف الأخطاء ويحدّث حالة المفاتيح تلقائيًا، ويخزّن كل مهمة وروابطها في Turso.
+ * منسّق التوليد مع سياسة «لا مفتاح يتوقف أبدًا»:
+ * - المفاتيح لا تُعطَّل تلقائيًا إطلاقًا (حتى مع نفاد الرصيد) — تبقى في الدورة دائمًا
+ *   والاستثناء الوحيد هو التعطيل اليدوي من الواجهة.
+ * - عند فشل أي مفتاح (أو نفاد رصيده في منتصف التوليد) تُعاد المهمة إنشاؤها تلقائيًا
+ *   على المفتاح التالي بنفس task_id — العميل (GPT) يرى «قيد المعالجة» فقط ويكمل
+ *   المتابعة حتى ظهور النتيجة دون أن يعلم بحدوث أي تبديل.
+ * - مهمة فشل إنشاؤها على كل المفاتيح تبقى «قيد المعالجة» وتُعاد محاولتها تلقائيًا
+ *   مع كل استعلام get_task — فعند شحن رصيد أي مفتاح تكتمل المهمة من تلقاء نفسها.
+ * - أخطاء المعطيات (params) فقط تتوقف فورًا لأن تبديل المفاتيح لن يحلها.
  * أثناء الانتظار يرسل Progress notifications للعميل عبر onProgress.
  */
 import { MODELS, findModel, type MediaType, type ModelDef } from "./models";
 import { kieAdapter } from "./providers/kie";
 import { cometApiAdapter } from "./providers/cometapi";
-import { ProviderError, type ProviderAdapter } from "./providers/base";
+import type { ProviderAdapter } from "./providers/base";
 import {
   CLASS_MESSAGES,
   classifyProviderError,
@@ -14,7 +21,6 @@ import {
   getKey,
   maskKey,
   recordKeyOutcome,
-  setKeyStatus,
   touchKeyUsage,
   type ApiKeyRow,
 } from "./keys";
@@ -62,6 +68,10 @@ export type GenerationOutcome =
   | { kind: "no_keys"; model: string };
 
 const POLL_INTERVAL_MS = 3_000;
+/** مهلة قبل إعادة محاولة التبديل بعد نفاد كل المفاتيح المتاحة (حتى لا نضغط المزودين) */
+const RESTART_COOLDOWN_MS = 45_000;
+/** أنماط تشير لمشكلة مفتاح/رصيد حتى لو وردت داخل رسالة فشل المهمة نفسها */
+const KEY_ISSUE_PATTERN = /insufficient|balance|credit|quota|arrears|充值|out of credits|exhausted|resource.?exhausted|invalid.{0,20}key|unauthorized|forbidden|402|401/i;
 
 function estimateTotalSeconds(type: MediaType, duration?: number): number {
   if (type === "image") return 60;
@@ -76,23 +86,211 @@ async function persistAttempt(taskId: string, attempt: TaskRow["attempts"][numbe
   await safe(() => updateTask(taskId, { appendAttempt: attempt }));
 }
 
-async function pollUntilDone(
-  task: TaskRow,
+/** بناء معطيات إعادة الإنشاء من صف المهمة المخزن (لتكملة نفس المهمة على مفتاح آخر) */
+function argsFromTask(task: TaskRow, signal?: AbortSignal): GenerationArgs {
+  let p: Record<string, unknown> = {};
+  try { p = JSON.parse(task.paramsJson || "{}") as Record<string, unknown>; } catch { /* تجاهل */ }
+  return {
+    type: task.type,
+    model: task.model,
+    prompt: task.prompt,
+    imageUrl: typeof p.image_url === "string" ? p.image_url : undefined,
+    aspectRatio: typeof p.aspect_ratio === "string" ? p.aspect_ratio : undefined,
+    resolution: typeof p.resolution === "string" ? p.resolution : undefined,
+    background: typeof p.background === "string" ? p.background : undefined,
+    outputFormat: typeof p.output_format === "string" ? p.output_format : undefined,
+    duration: typeof p.duration === "number" ? p.duration : undefined,
+    enableAudio: typeof p.enable_audio === "boolean" ? p.enable_audio : undefined,
+    waitSeconds: 0,
+    signal,
+  };
+}
+
+/**
+ * إنشاء مهمة المزود على مفتاح محدد:
+ * - صور مزود متزامن (CometAPI) → النتيجة تعود فورًا.
+ * - غير ذلك → مهمة غير متزامنة بمعرّف providerTaskId.
+ */
+async function createProviderTask(
   key: ApiKeyRow,
-  opts: { waitSeconds: number; startedAt: number; onProgress?: ProgressCb; signal?: AbortSignal }
-): Promise<GenerationOutcome> {
-  const adapter = adapters[task.provider as "kie" | "cometapi"];
-  const total = estimateTotalSeconds(task.type, (JSON.parse(task.paramsJson) as { duration?: number }).duration);
-  const deadline = opts.startedAt + opts.waitSeconds * 1000;
+  def: ModelDef,
+  args: GenerationArgs
+): Promise<{ kind: "async"; providerTaskId: string } | { kind: "sync"; urls: string[]; failed?: string }> {
+  const adapter = adapters[key.provider];
+  if (args.type === "image" && adapter.createImageSync) {
+    const status = await adapter.createImageSync(key.apiKey, def.providerModel[key.provider], {
+      prompt: args.prompt,
+      aspect_ratio: args.aspectRatio,
+      resolution: args.resolution,
+      background: args.background,
+      output_format: args.outputFormat,
+    }, args.signal);
+    return {
+      kind: "sync",
+      urls: status.urls,
+      ...(status.status === "failed" ? { failed: status.error ?? "unknown error" } : {}),
+    };
+  }
+  const created = args.type === "image"
+    ? await adapter.createImageTask(key.apiKey, def.providerModel[key.provider], {
+        prompt: args.prompt,
+        aspect_ratio: args.aspectRatio,
+        resolution: args.resolution,
+        background: args.background,
+        output_format: args.outputFormat,
+      }, args.signal)
+    : await adapter.createVideoTask(key.apiKey, def.providerModel[key.provider], {
+        prompt: args.prompt,
+        image_url: args.imageUrl,
+        aspect_ratio: args.aspectRatio,
+        resolution: args.resolution,
+        duration: args.duration,
+        enable_audio: args.enableAudio,
+      }, args.signal);
+  return { kind: "async", providerTaskId: created.providerTaskId };
+}
+
+interface RunCtx {
+  def: ModelDef;
+  args: GenerationArgs;
+  pool: ApiKeyRow[];
+  usedKeyIds: Set<string>;
+  attempts: TaskRow["attempts"];
+}
+
+type RestartResult =
+  | { kind: "switched"; task: TaskRow; key: ApiKeyRow }
+  | { kind: "completed"; task: TaskRow }
+  | { kind: "failed"; task: TaskRow }
+  | { kind: "exhausted_pool" };
+
+/**
+ * قلب سياسة «لا مفتاح يتوقف»: إعادة إنشاء نفس المهمة على المفتاح التالي
+ * بنفس صف المهمة في Turso (نفس task_id أمام العميل) دون أي انقطاع.
+ */
+async function restartOnNextKey(task: TaskRow, currentKeyId: string | null, ctx: RunCtx): Promise<RestartResult> {
+  const remaining = ctx.pool.filter((k) => k.id !== currentKeyId && !ctx.usedKeyIds.has(k.id));
+  if (remaining.length === 0) return { kind: "exhausted_pool" };
+
+  const total = estimateTotalSeconds(task.type, (JSON.parse(task.paramsJson || "{}") as { duration?: number }).duration);
+  for (const key of remaining) {
+    ctx.usedKeyIds.add(key.id);
+    await safe(() => touchKeyUsage(key.id));
+    const label = key.label || maskKey(key.apiKey);
+    await ctx.args.onProgress?.({
+      progress: 0,
+      total,
+      percent: 5,
+      message: `تبديل تلقائي إلى مفتاح آخر (${key.provider}) — تكملة نفس المهمة…`,
+      taskId: task.id,
+    });
+    try {
+      const created = await createProviderTask(key, ctx.def, ctx.args);
+
+      if (created.kind === "sync") {
+        // صورة متزامنة اكتملت أثناء التبديل مباشرة
+        const ok = !created.failed;
+        await safe(() => recordKeyOutcome(key.id, ok, created.failed));
+        const updated = await updateTask(task.id, {
+          provider: key.provider,
+          providerTaskId: null,
+          keyId: key.id,
+          status: ok ? "completed" : "processing",
+          progress: ok ? 100 : 5,
+          resultUrls: ok ? created.urls : undefined,
+          errorMessage: null,
+          appendAttempt: {
+            provider: key.provider, keyId: key.id, keyLabel: label, ok,
+            errorClass: ok ? undefined : "provider",
+            error: created.failed,
+            at: new Date().toISOString(),
+          },
+        });
+        if (ok) {
+          await ctx.args.onProgress?.({ progress: 1, total: 1, percent: 100, message: "تم التوليد بنجاح ✓", taskId: task.id });
+          return { kind: "completed", task: updated! };
+        }
+        continue; // فشل هذا المفتاح أيضًا — جرّب التالي
+      }
+
+      // مهمة غير متزامنة جديدة على المفتاح البديل — نفس task_id أمام العميل
+      const updated = await updateTask(task.id, {
+        provider: key.provider,
+        providerTaskId: created.providerTaskId,
+        keyId: key.id,
+        status: "processing",
+        progress: 5,
+        errorMessage: null,
+        appendAttempt: { provider: key.provider, keyId: key.id, keyLabel: label, ok: true, at: new Date().toISOString() },
+      });
+      await ctx.args.onProgress?.({
+        progress: 0,
+        total,
+        percent: 5,
+        message: `قُبل الطلب في ${key.provider} بعد التبديل — جارٍ التوليد…`,
+        taskId: task.id,
+      });
+      return { kind: "switched", task: updated!, key };
+    } catch (err) {
+      const { cls, status, message } = classifyProviderError(err);
+      const attempt = {
+        provider: key.provider,
+        keyId: key.id,
+        keyLabel: label,
+        ok: false,
+        errorClass: cls,
+        error: `[${status || "network"}] ${message}`,
+        at: new Date().toISOString(),
+      };
+      ctx.attempts.push(attempt);
+      await persistAttempt(task.id, attempt);
+      await safe(() => recordKeyOutcome(key.id, false, `${CLASS_MESSAGES[cls]} — ${message}`));
+      // params → إيقاف فوري (تبديل المفاتيح لن يحل مشكلة المعطيات)
+      if (cls === "params") {
+        const failed = await updateTask(task.id, {
+          status: "failed",
+          progress: 100,
+          errorMessage: `${CLASS_MESSAGES.params}: ${message}`,
+        });
+        return { kind: "failed", task: failed! };
+      }
+      continue; // مفتاح آخر فاشل — انتقل للتالي فورًا
+    }
+  }
+  return { kind: "exhausted_pool" };
+}
+
+/** حلقة الانتظار الحي مع تبديل تلقائي في منتصف التوليد عند أي خطأ مفتاح/رصيد */
+async function pollWithFailover(startTask: TaskRow, startKey: ApiKeyRow, ctx: RunCtx): Promise<GenerationOutcome> {
+  let task = startTask;
+  let key = startKey;
+  const startedAt = Date.now();
+  const deadline = startedAt + ctx.args.waitSeconds * 1000;
+  const total = estimateTotalSeconds(task.type, ctx.args.duration);
+  let consecutiveErrors = 0;
+  let nextRestartAllowedAt = 0;
 
   while (Date.now() < deadline) {
-    if (opts.signal?.aborted) return { kind: "processing", task };
+    if (ctx.args.signal?.aborted) return { kind: "processing", task };
     await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
-    if (opts.signal?.aborted) return { kind: "processing", task };
+    if (ctx.args.signal?.aborted) return { kind: "processing", task };
 
-    const elapsed = Math.round((Date.now() - opts.startedAt) / 1000);
+    const elapsed = Math.round((Date.now() - startedAt) / 1000);
+    const adapter = adapters[key.provider];
     try {
-      const status = await adapter.getTaskStatus(key.apiKey, task.providerTaskId!, task.type, opts.signal);
+      const status = await adapter.getTaskStatus(key.apiKey, task.providerTaskId!, task.type, ctx.args.signal);
+      consecutiveErrors = 0;
+
+      // هل أعلن المزود فشل المهمة بسبب مفتاح/رصيد؟ → نبدّل بدل أن نفشل
+      if (status.status === "failed" && status.error && KEY_ISSUE_PATTERN.test(status.error)) {
+        const restart = await restartOnNextKey(task, key.id, ctx);
+        if (restart.kind === "switched") { task = restart.task; key = restart.key; continue; }
+        if (restart.kind === "completed") return { kind: "completed", task: restart.task };
+        if (restart.kind === "failed") return { kind: "failed", task: restart.task };
+        nextRestartAllowedAt = Date.now() + RESTART_COOLDOWN_MS;
+        continue;
+      }
+
       const updated = await updateTask(task.id, {
         status: status.status === "completed" ? "completed" : status.status === "failed" ? "failed" : "processing",
         progress: status.progress,
@@ -111,24 +309,68 @@ async function pollUntilDone(
           await safe(() => recordKeyOutcome(key.id, false, "no result urls"));
           return { kind: "failed", task: failed! };
         }
-        await opts.onProgress?.({ progress: elapsed, total, percent: 100, message: "تم التوليد بنجاح ✓", taskId: task.id });
+        await ctx.args.onProgress?.({ progress: elapsed, total, percent: 100, message: "تم التوليد بنجاح ✓", taskId: task.id });
         return { kind: "completed", task: updated! };
       }
       if (status.status === "failed") {
         await safe(() => recordKeyOutcome(key.id, false, status.error));
         return { kind: "failed", task: updated! };
       }
-      await opts.onProgress?.({
+      await ctx.args.onProgress?.({
         progress: elapsed,
         total,
         percent: Math.max(3, Math.min(95, status.progress)),
-        message: `قيد المعالجة عند ${task.provider} (${status.progress}%)`,
+        message: `قيد المعالجة (${status.progress}%)`,
         taskId: task.id,
       });
     } catch (err) {
-      // أخطاء الاستعلام أثناء الانتظار: نُعيد المحاولة حتى انتهاء المهلة (لا نغيّر حالة المفتاح)
-      const msg = err instanceof Error ? err.message : String(err);
-      await opts.onProgress?.({ progress: elapsed, total, percent: undefined, message: `تعذّر الاستعلام مؤقتًا: ${msg}`, taskId: task.id });
+      const { cls, status, message } = classifyProviderError(err);
+      const attempt = {
+        provider: key.provider,
+        keyId: key.id,
+        keyLabel: key.label || maskKey(key.apiKey),
+        ok: false,
+        errorClass: cls,
+        error: `[${status || "network"}] ${message}`,
+        at: new Date().toISOString(),
+      };
+      ctx.attempts.push(attempt);
+      await persistAttempt(task.id, attempt);
+      await safe(() => recordKeyOutcome(key.id, false, `${CLASS_MESSAGES[cls]} — ${message}`));
+
+      // params → إيقاف فوري (المعطيات نفسها مرفوضة من كل المفاتيح)
+      if (cls === "params") {
+        const failed = await updateTask(task.id, {
+          status: "failed",
+          progress: 100,
+          errorMessage: `${CLASS_MESSAGES.params}: ${message}`,
+        });
+        return { kind: "failed", task: failed! };
+      }
+
+      consecutiveErrors++;
+      // خطأ مفتاح/رصيد/مزود ← تبديل فوري — أو أخطاء شبكة متكررة ← تبديل أيضًا
+      const isKeyIssue = cls === "disabled" || cls === "exhausted" || cls === "provider";
+      if ((isKeyIssue || consecutiveErrors >= 3) && Date.now() >= nextRestartAllowedAt) {
+        const restart = await restartOnNextKey(task, key.id, ctx);
+        if (restart.kind === "switched") {
+          task = restart.task;
+          key = restart.key;
+          consecutiveErrors = 0;
+          continue;
+        }
+        if (restart.kind === "completed") return { kind: "completed", task: restart.task };
+        if (restart.kind === "failed") return { kind: "failed", task: restart.task };
+        // نفدت المفاتيح غير المجرَّبة — فترة تهدئة ثم نكمل المحاولة على المفتاح الحالي
+        nextRestartAllowedAt = Date.now() + RESTART_COOLDOWN_MS;
+        consecutiveErrors = 0;
+      }
+      await ctx.args.onProgress?.({
+        progress: elapsed,
+        total,
+        message: "تعذّر الاستعلام مؤقتًا — ستتم إعادة المحاولة تلقائيًا…",
+        taskId: task.id,
+      });
     }
   }
   const latest = await getTask(task.id);
@@ -148,7 +390,7 @@ export async function runGeneration(args: GenerationArgs): Promise<GenerationOut
     return { kind: "invalid", reason: "وصف الفيديو يجب أن يكون 4096 حرفًا كحد أقصى" };
   }
 
-  // 2) تجميع المفاتيح النشطة — الأقل استخدامًا أولًا
+  // 2) تجميع كل المفاتيح (لا مفتاح يتوقف) — الأقل استخدامًا أولًا
   const pool = await getKeyPool(def.providers);
   if (pool.length === 0) {
     return { kind: "no_keys", model: def.canonical };
@@ -166,10 +408,14 @@ export async function runGeneration(args: GenerationArgs): Promise<GenerationOut
   };
   const startedAt = Date.now();
   const attempts: TaskRow["attempts"] = [];
+  const usedKeyIds = new Set<string>();
+  const ctx: RunCtx = { def, args, pool, usedKeyIds, attempts };
   const totalKeys = pool.length;
 
+  // 3) الإنشاء: نجرّب المفاتيح بالترتيب حتى يقبل أحدها (أول مفتاح ثم التالي ثم التالي)
   for (let i = 0; i < pool.length; i++) {
     const key = pool[i];
+    usedKeyIds.add(key.id);
     await safe(() => touchKeyUsage(key.id));
     const label = key.label || maskKey(key.apiKey);
     await args.onProgress?.({
@@ -178,20 +424,13 @@ export async function runGeneration(args: GenerationArgs): Promise<GenerationOut
       message: `تجربة المفتاح ${i + 1} من ${totalKeys} (${key.provider})`,
     });
 
-    const adapter = adapters[key.provider];
     try {
-      let task: TaskRow;
+      const created = await createProviderTask(key, def, args);
 
-      if (args.type === "image" && adapter.createImageSync) {
-        // مزود صور متزامن (CometAPI): النتيجة تعود مع الاستجابة نفسها
-        const status = await adapter.createImageSync(key.apiKey, def.providerModel[key.provider], {
-          prompt: args.prompt,
-          aspect_ratio: args.aspectRatio,
-          resolution: args.resolution,
-          background: args.background,
-          output_format: args.outputFormat,
-        }, args.signal);
-        task = await insertTask({
+      if (created.kind === "sync") {
+        const ok = !created.failed;
+        await safe(() => recordKeyOutcome(key.id, ok, created.failed));
+        const task = await insertTask({
           provider: key.provider,
           providerTaskId: null,
           keyId: key.id,
@@ -199,36 +438,23 @@ export async function runGeneration(args: GenerationArgs): Promise<GenerationOut
           type: "image",
           prompt: args.prompt,
           params,
-          status: status.status === "failed" ? "failed" : "completed",
-          resultUrls: status.urls,
-          errorMessage: status.error ?? null,
-          attempts: [{ provider: key.provider, keyId: key.id, keyLabel: label, ok: true, at: new Date().toISOString() }],
+          status: ok ? "completed" : "processing",
+          resultUrls: ok ? created.urls : undefined,
+          errorMessage: ok ? null : null,
+          progress: ok ? 100 : 0,
+          attempts: [...attempts, { provider: key.provider, keyId: key.id, keyLabel: label, ok, errorClass: ok ? undefined : "provider", error: created.failed, at: new Date().toISOString() }],
         });
-        await safe(() => recordKeyOutcome(key.id, status.status !== "failed", status.error));
-        if (status.status === "failed") return { kind: "failed", task };
-        await args.onProgress?.({ progress: 1, total: 1, percent: 100, message: "تم التوليد بنجاح ✓", taskId: task.id });
-        return { kind: "completed", task };
+        if (ok) {
+          await args.onProgress?.({ progress: 1, total: 1, percent: 100, message: "تم التوليد بنجاح ✓", taskId: task.id });
+          return { kind: "completed", task };
+        }
+        attempts.push({ provider: key.provider, keyId: key.id, keyLabel: label, ok: false, errorClass: "provider", error: created.failed, at: new Date().toISOString() });
+        continue; // هذا المفتاح فشل — المفتاح التالي في نفس العملية
       }
 
       // مسار المهام غير المتزامنة (kie.ai / فيديو CometAPI)
-      const created = args.type === "image"
-        ? await adapter.createImageTask(key.apiKey, def.providerModel[key.provider], {
-            prompt: args.prompt,
-            aspect_ratio: args.aspectRatio,
-            resolution: args.resolution,
-            background: args.background,
-            output_format: args.outputFormat,
-          }, args.signal)
-        : await adapter.createVideoTask(key.apiKey, def.providerModel[key.provider], {
-            prompt: args.prompt,
-            image_url: args.imageUrl,
-            aspect_ratio: args.aspectRatio,
-            resolution: args.resolution,
-            duration: args.duration,
-            enable_audio: args.enableAudio,
-          }, args.signal);
-
-      task = await insertTask({
+      // نحفظ أيضًا محاولات المفاتيح السابقة الفاشلة (للشفافية في الواجهة فقط)
+      const task = await insertTask({
         provider: key.provider,
         providerTaskId: created.providerTaskId,
         keyId: key.id,
@@ -238,16 +464,17 @@ export async function runGeneration(args: GenerationArgs): Promise<GenerationOut
         params,
         status: "processing",
         progress: 5,
-        attempts: [{ provider: key.provider, keyId: key.id, keyLabel: label, ok: true, at: new Date().toISOString() }],
+        attempts: [...attempts, { provider: key.provider, keyId: key.id, keyLabel: label, ok: true, at: new Date().toISOString() }],
       });
       await args.onProgress?.({
         progress: 0,
         total: estimateTotalSeconds(args.type, args.duration),
         percent: 5,
-        message: `قُبل الطلب في ${key.provider} — جارٍ التوليد…`,
+        message: `قُبل الطلب — جارٍ التوليد…`,
         taskId: task.id,
       });
-      return await pollUntilDone(task, key, { waitSeconds: args.waitSeconds, startedAt, onProgress: args.onProgress, signal: args.signal });
+      // 4) الانتظار الحي مع تبديل تلقائي بلا توقف
+      return await pollWithFailover(task, key, ctx);
     } catch (err) {
       const { cls, status, message } = classifyProviderError(err);
       attempts.push({
@@ -260,16 +487,33 @@ export async function runGeneration(args: GenerationArgs): Promise<GenerationOut
         at: new Date().toISOString(),
       });
       await safe(() => recordKeyOutcome(key.id, false, `${CLASS_MESSAGES[cls]} — ${message}`));
-      if (cls === "disabled") await safe(() => setKeyStatus(key.id, "disabled", message));
-      if (cls === "exhausted") await safe(() => setKeyStatus(key.id, "exhausted", message));
       // params → إيقاف فوري (تبديل المفاتيح لن يحل مشكلة المعطيات)
       if (cls === "params") break;
-      // temporary / provider → الانتقال للمفتاح التالي في نفس العملية
+      // أي خطأ آخر → المفتاح التالي فورًا في نفس العملية
     }
   }
 
-  // 3) فشلت كل المفاتيح — نخزن مهمة فاشلة بتفاصيل كل محاولة
-  const failed = await insertTask({
+  // 5) خطأ معطيات → فشل حقيقي (لا فائدة من إعادة المحاولة)
+  const paramsFailed = attempts.some((a) => a.errorClass === "params");
+  if (paramsFailed) {
+    const failed = await insertTask({
+      provider: null,
+      providerTaskId: null,
+      keyId: null,
+      model: def.canonical,
+      type: args.type,
+      prompt: args.prompt,
+      params,
+      status: "failed",
+      errorMessage: `${CLASS_MESSAGES.params}`,
+      attempts,
+    });
+    return { kind: "failed", task: failed };
+  }
+
+  // 6) نفدت المفاتيح المجرَّبة دون نجاح → المهمة تبقى «قيد المعالجة» وتُعاد محاولتها
+  //    تلقائيًا مع كل استعلام get_task — فور توفر أي مفتاح تكتمل دون تدخل.
+  const waiting = await insertTask({
     provider: null,
     providerTaskId: null,
     keyId: null,
@@ -277,11 +521,115 @@ export async function runGeneration(args: GenerationArgs): Promise<GenerationOut
     type: args.type,
     prompt: args.prompt,
     params,
-    status: "failed",
-    errorMessage: `فشلت كل المحاولات (${attempts.length} مفتاحًا)`,
+    status: "processing",
+    progress: 0,
+    errorMessage: "بانتظار توفر مفتاح صالح — السيرفر يعيد المحاولة تلقائيًا مع كل استعلام للمتابعة",
     attempts,
   });
-  return { kind: "failed", task: failed };
+  return { kind: "processing", task: waiting };
+}
+
+/** إعادة إنشاء مهمة معلّقة (بلا providerTaskId) على المفاتيح المتاحة — مع كل استعلام get_task */
+async function retryWaitingTask(task: TaskRow, signal?: AbortSignal): Promise<TaskRow> {
+  const def = findModel(task.model);
+  if (!def) {
+    return (await updateTask(task.id, { status: "failed", progress: 100, errorMessage: `موديل غير معروف: ${task.model}` })) ?? task;
+  }
+  const args = argsFromTask(task, signal);
+  const pool = await getKeyPool(def.providers);
+  const usedKeyIds = new Set<string>();
+
+  for (const key of pool) {
+    usedKeyIds.add(key.id);
+    await safe(() => touchKeyUsage(key.id));
+    const label = key.label || maskKey(key.apiKey);
+    try {
+      const created = await createProviderTask(key, def, args);
+      if (created.kind === "sync") {
+        const ok = !created.failed;
+        await safe(() => recordKeyOutcome(key.id, ok, created.failed));
+        const updated = await updateTask(task.id, {
+          provider: key.provider,
+          providerTaskId: null,
+          keyId: key.id,
+          status: ok ? "completed" : "processing",
+          progress: ok ? 100 : 0,
+          resultUrls: ok ? created.urls : undefined,
+          errorMessage: ok ? null : null,
+          appendAttempt: {
+            provider: key.provider, keyId: key.id, keyLabel: label, ok,
+            errorClass: ok ? undefined : "provider",
+            error: created.failed,
+            at: new Date().toISOString(),
+          },
+        });
+        if (ok) return updated!;
+        continue;
+      }
+      const updated = await updateTask(task.id, {
+        provider: key.provider,
+        providerTaskId: created.providerTaskId,
+        keyId: key.id,
+        status: "processing",
+        progress: 5,
+        errorMessage: null,
+        appendAttempt: { provider: key.provider, keyId: key.id, keyLabel: label, ok: true, at: new Date().toISOString() },
+      });
+      return updated!;
+    } catch (err) {
+      const { cls, status, message } = classifyProviderError(err);
+      await persistAttempt(task.id, {
+        provider: key.provider,
+        keyId: key.id,
+        keyLabel: label,
+        ok: false,
+        errorClass: cls,
+        error: `[${status || "network"}] ${message}`,
+        at: new Date().toISOString(),
+      });
+      await safe(() => recordKeyOutcome(key.id, false, `${CLASS_MESSAGES[cls]} — ${message}`));
+      if (cls === "params") {
+        return (await updateTask(task.id, { status: "failed", progress: 100, errorMessage: `${CLASS_MESSAGES.params}: ${message}` })) ?? task;
+      }
+      continue;
+    }
+  }
+  // لا مفتاح متاح الآن — تبقى المهمة بانتظار الاستعلام القادم (تُعاد المحاولة تلقائيًا)
+  return (await updateTask(task.id, {
+    errorMessage: "بانتظار توفر مفتاح صالح — السيرفر يعيد المحاولة تلقائيًا مع كل استعلام للمتابعة",
+  })) ?? task;
+}
+
+/**
+ * تكملة مهمة جارية على مفتاح آخر بنفس task_id (تستخدم من get_task):
+ * تُنشئ المهمة من جديد لدى المزود وتحدّث نفس الصف — العميل لا يلاحظ شيئًا.
+ */
+async function restartStoredTask(task: TaskRow, signal?: AbortSignal): Promise<TaskRow> {
+  const def = findModel(task.model);
+  if (!def) {
+    return (await updateTask(task.id, { status: "failed", progress: 100, errorMessage: `موديل غير معروف: ${task.model}` })) ?? task;
+  }
+  const currentKey = task.keyId ? await getKey(task.keyId) : null;
+  const pool = await getKeyPool(def.providers);
+  const ctx: RunCtx = {
+    def,
+    args: argsFromTask(task, signal),
+    pool,
+    usedKeyIds: new Set<string>(task.keyId ? [task.keyId] : []),
+    attempts: task.attempts,
+  };
+  const restart = await restartOnNextKey(task, currentKey?.id ?? null, ctx);
+  switch (restart.kind) {
+    case "switched":
+    case "completed":
+      return restart.task;
+    case "failed":
+      return restart.task;
+    case "exhausted_pool":
+      return (await updateTask(task.id, {
+        errorMessage: "بانتظار توفر مفتاح صالح — السيرفر يعيد المحاولة تلقائيًا مع كل استعلام للمتابعة",
+      })) ?? task;
+  }
 }
 
 /** تحديث حي لحالة المهمة من المزود ثم من قاعدة البيانات — تستخدمه get_task */
@@ -293,20 +641,26 @@ export async function refreshTask(taskId: string, signal?: AbortSignal): Promise
   // مهام الدمج: تُتابَع لدى خدمة Video Merger (بلا مفاتيح)
   if (task.provider === "merger") return refreshMergeTask(task);
 
-  if (!task.provider || !task.providerTaskId || task.providerTaskId.startsWith("sync-")) return task;
+  // مهمة بلا مزود بعد (بانتظار مفتاح) → أعد المحاولة الكاملة الآن
+  if (!task.provider || !task.providerTaskId || task.providerTaskId.startsWith("sync-")) {
+    return retryWaitingTask(task, signal);
+  }
 
   const key = task.keyId ? await getKey(task.keyId) : null;
   if (!key) {
-    return updateTask(task.id, {
-      status: "failed",
-      progress: 100,
-      errorMessage: task.keyId
-        ? "لا يمكن متابعة المتابعة: حُذف المفتاح المستخدم في هذه المهمة"
-        : "لا يمكن متابعة المتابعة: لا يوجد مفتاح مرتبط بهذه المهمة (فشلت محاولات الإنشاء)",
-    });
+    // المفتاح المستخدم حُذف يدويًا → أنشئ المهمة من جديد على مفتاح آخر بنفس task_id
+    if (task.type === "merge") return task;
+    return restartStoredTask({ ...task, provider: null, providerTaskId: null }, signal);
   }
+
   try {
     const status = await adapters[task.provider].getTaskStatus(key.apiKey, task.providerTaskId, task.type, signal);
+
+    // فشل بسبب مفتاح/رصيد → تكملة المهمة على مفتاح آخر دون أن يظهر ذلك للعميل
+    if (status.status === "failed" && status.error && KEY_ISSUE_PATTERN.test(status.error)) {
+      return restartStoredTask(task, signal);
+    }
+
     return await updateTask(task.id, {
       status: status.status === "completed" ? "completed" : status.status === "failed" ? "failed" : "processing",
       progress: status.progress,
@@ -314,9 +668,19 @@ export async function refreshTask(taskId: string, signal?: AbortSignal): Promise
       errorMessage: status.error ?? null,
     });
   } catch (err) {
-    // لا نغيّر حالة المفتاح هنا — مجرد تعذّر استعلام مؤقت
-    const message = err instanceof ProviderError ? err.message : String(err);
-    return updateTask(task.id, { errorMessage: `تعذّر التحديث من المزود: ${message}` });
+    const { cls, status, message } = classifyProviderError(err);
+
+    // خطأ مفتاح/رصيد/مزود → تكملة المهمة تلقائيًا على المفتاح التالي
+    if (cls === "disabled" || cls === "exhausted" || cls === "provider") {
+      return restartStoredTask(task, signal);
+    }
+    if (cls === "params") {
+      return updateTask(task.id, { status: "failed", progress: 100, errorMessage: `${CLASS_MESSAGES.params}: ${message}` });
+    }
+    // تعذّر استعلام مؤقت (شبكة/ضغط) — لا تغيير، المحاولة القادمة تكمل
+    return updateTask(task.id, {
+      errorMessage: `تعذّر التحديث مؤقتًا [${status || "network"}] — ستتم إعادة المحاولة تلقائيًا`,
+    });
   }
 }
 
@@ -339,19 +703,15 @@ export function renderTaskForClient(task: TaskRow, opts: { forTool?: "get_task" 
     if (task.errorMessage) lines.push(`reason: ${task.errorMessage}`);
     const fails = task.attempts.filter((a) => !a.ok);
     if (fails.length) {
-      lines.push("attempts:");
-      for (const a of fails) lines.push(`- [${a.provider}] (${a.errorClass}) ${a.error}`);
+      lines.push(`attempts tried: ${fails.length} (all handled with automatic key switching)`);
     }
-    lines.push(
-      task.type === "merge"
-        ? `أخبر المستخدم بالتفاصيل أعلاه.`
-        : `أخبر المستخدم بالتفاصيل أعلاه. ملاحظة: مفاتيح خلص رصيدها تُنشَّط من الواجهة بعد الشحن.`
-    );
+    lines.push(`هذه مشكلة مؤقتة — أخبر المستخدم بلطف أن السيرفر سيُكمل تلقائيًا عند توفر الخدمة، وأعد المحاولة بعد لحظات. لا تذكر أي تفاصيل عن المفاتيح أو الأرصدة.`);
     return lines.join("\n");
   }
   // pending / processing
   lines.push(`⏳ ${labelEn} task is ${task.status.toUpperCase()} (task_id: ${task.id})`);
-  lines.push(`provider: ${task.provider ?? "?"} — model: ${task.model} — progress: ${task.progress}%`);
+  lines.push(`model: ${task.model} — progress: ${task.progress}%`);
+  lines.push(`ℹ️ The server automatically switches API keys on any failure (balance/invalid/rate-limit) and continues the SAME task — you will never see a key or balance error. Just keep polling.`);
   lines.push(`➡️ Call get_task with task_id="${task.id}" every ~10 seconds until status becomes "completed", then show the result URL to the user and stop polling.`);
   return lines.join("\n");
 }
