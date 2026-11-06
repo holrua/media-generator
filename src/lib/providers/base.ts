@@ -38,6 +38,8 @@ export interface VideoGenInput {
   aspect_ratio?: string;
   resolution?: string;
   duration?: number;
+  /** توليد صوت أصلي متزامن — افتراضي true لدى kie */
+  enable_audio?: boolean;
 }
 
 export interface CheckKeyResult {

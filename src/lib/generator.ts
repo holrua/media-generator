@@ -47,6 +47,7 @@ export interface GenerationArgs {
   background?: string;
   outputFormat?: string;
   duration?: number;
+  enableAudio?: boolean;
   waitSeconds: number;
   onProgress?: ProgressCb;
   signal?: AbortSignal;
@@ -158,6 +159,7 @@ export async function runGeneration(args: GenerationArgs): Promise<GenerationOut
     background: args.background,
     output_format: args.outputFormat,
     duration: args.duration,
+    enable_audio: args.enableAudio,
     image_url: args.imageUrl,
     wait_seconds: args.waitSeconds,
   };
@@ -222,6 +224,7 @@ export async function runGeneration(args: GenerationArgs): Promise<GenerationOut
             aspect_ratio: args.aspectRatio,
             resolution: args.resolution,
             duration: args.duration,
+            enable_audio: args.enableAudio,
           }, args.signal);
 
       task = await insertTask({

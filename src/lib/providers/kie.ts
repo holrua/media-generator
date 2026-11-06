@@ -5,7 +5,10 @@
  *   الحالات: waiting | queuing | generating | success | fail
  *   النتيجة: data.resultJson = '{"resultUrls":["..."]}' + data.progress + data.failMsg
  * - فحص الرصيد:  GET  {base}/api/v1/chat/credit  (مجاني)
- * ملاحظة: أخطاء kie.ai قد تعود بـ HTTP 200 مع code داخل الجسم — نوحّدها.
+ * ملاحظة ١: أخطاء kie.ai قد تعود بـ HTTP 200 مع code داخل الجسم — نوحّدها.
+ * ملاحظة ٢: لو رفض kie اسم الموديل بصيغة معينة، نجرّب الصيغة البديلة تلقائيًا
+ *           (gpt-image-2.6 ↔ gpt-image-2-6 ، grok-imagine-video-1.5-preview ↔ grok-imagine-video-1-5-preview)
+ *           حتى يعمل الطلب سواء أرسل العميل الاسم بالشرطات أو بالنقاط.
  */
 import {
   fetchWithTimeout,
@@ -33,6 +36,40 @@ function assertKieOk(body: Record<string, unknown>) {
 
 function cleanInput(obj: Record<string, unknown>): Record<string, unknown> {
   return Object.fromEntries(Object.entries(obj).filter(([, v]) => v !== undefined && v !== null && v !== ""));
+}
+
+/** صيغ بديلة لاسم الموديل لدى kie — تُجرّب تلقائيًا إذا رفض kie الاسم الأول */
+const KIE_MODEL_ALTERNATES: Record<string, string> = {
+  "gpt-image-2.6/flare-text-to-image": "gpt-image-2-6/flare-text-to-image",
+  "gpt-image-2-6/flare-text-to-image": "gpt-image-2.6/flare-text-to-image",
+  "grok-imagine-video-1-5-preview": "grok-imagine-video-1.5-preview",
+  "grok-imagine-video-1.5-preview": "grok-imagine-video-1-5-preview",
+};
+
+function isModelRejected(err: unknown): boolean {
+  if (!(err instanceof ProviderError)) return false;
+  const m = (err.message || "").toLowerCase();
+  return (
+    /model[^;]{0,40}(not|un)[^;]{0,20}(found|support|available)|unsupported model|unknown model|invalid model|no such model/.test(m) ||
+    (err.status === 400 && /model/.test(m) && /invalid|not|unknown|unsupported/.test(m))
+  );
+}
+
+async function createTaskWithFallback(
+  key: string,
+  model: string,
+  input: Record<string, unknown>,
+  signal?: AbortSignal
+): Promise<CreateTaskResult> {
+  try {
+    return await createTask(key, model, input, signal);
+  } catch (err) {
+    const alt = KIE_MODEL_ALTERNATES[model];
+    if (alt && isModelRejected(err)) {
+      return await createTask(key, alt, input, signal);
+    }
+    throw err;
+  }
 }
 
 async function createTask(
@@ -75,7 +112,7 @@ export const kieAdapter: ProviderAdapter = {
   id: "kie",
 
   async createImageTask(key, model, input: ImageGenInput, signal) {
-    return createTask(
+    return createTaskWithFallback(
       key,
       model,
       cleanInput({
@@ -90,7 +127,7 @@ export const kieAdapter: ProviderAdapter = {
   },
 
   async createVideoTask(key, model, input: VideoGenInput, signal) {
-    return createTask(
+    return createTaskWithFallback(
       key,
       model,
       cleanInput({
@@ -99,6 +136,7 @@ export const kieAdapter: ProviderAdapter = {
         aspect_ratio: input.aspect_ratio,
         resolution: input.resolution,
         duration: input.duration,
+        enable_audio: input.enable_audio,
       }),
       signal
     );

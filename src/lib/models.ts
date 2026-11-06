@@ -22,7 +22,8 @@ export const MODELS: ModelDef[] = [
     type: "image",
     providers: ["kie", "cometapi"],
     providerModel: {
-      kie: "gpt-image-2.6/flare-text-to-image",
+      // الاسم الأساسي بالشرطات كما طلبه المستخدم (الصيغة بالنقاط تُجرَّب تلقائيًا عند الرفض)
+      kie: process.env.KIE_IMAGE_MODEL || "gpt-image-2-6/flare-text-to-image",
       cometapi: process.env.COMETAPI_IMAGE_MODEL || "gpt-image-2.6-flare-text-to-image",
     },
     description:
@@ -34,7 +35,8 @@ export const MODELS: ModelDef[] = [
     type: "video",
     providers: ["kie", "cometapi"],
     providerModel: {
-      kie: "grok-imagine-video-1.5-preview",
+      // الاسم الرسمي لدى kie.ai بالشرطات (موثّق رسميًا: grok-imagine-video-1-5-preview)
+      kie: process.env.KIE_VIDEO_MODEL || "grok-imagine-video-1-5-preview",
       cometapi: process.env.COMETAPI_VIDEO_MODEL || "grok-imagine-video-1-5-preview",
     },
     description:
