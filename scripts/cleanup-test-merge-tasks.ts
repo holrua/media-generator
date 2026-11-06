@@ -1,10 +1,10 @@
-/** حذف مهام الدمج التجريبية الفاشلة (الناتجة عن اختبارات هذه الجلسة) من Turso */
+/** حذف مهام الدمج التجريبية (مقاطع w3schools التجريبية) من Turso */
 import { getTurso, ensureSchema } from "../src/lib/turso";
 
 async function main() {
   await ensureSchema();
   const res = await getTurso().execute({
-    sql: `DELETE FROM tasks WHERE type = 'merge' AND status = 'failed' AND error_message LIKE '%فشل إنشاء مهمة الدمج%' RETURNING id`,
+    sql: `DELETE FROM tasks WHERE type = 'merge' AND prompt LIKE '%دمج 2 مقاطع%' RETURNING id`,
   });
   console.log(`deleted ${res.rows.length} test merge task(s)`);
 }

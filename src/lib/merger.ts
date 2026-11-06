@@ -16,7 +16,7 @@
  */
 import { insertTask, updateTask, type TaskRow } from "./tasks";
 
-export const MERGER_BASE = (process.env.MERGER_API_BASE || "https://preview-chat-99ac1857-71ca-469f-ad48-c970a5213513-z.ai")
+export const MERGER_BASE = (process.env.MERGER_API_BASE || "https://preview-chat-2263d573-4119-4428-acc3-b8916911b923.space-z.ai")
   .trim()
   .replace(/\/+$/, "");
 
@@ -84,13 +84,26 @@ export function parseJobStatus(data: unknown): MergeJobStatus {
   if (completed) progress = 100;
   if (failed) progress = Math.max(progress, 100);
 
-  // رابط النتيجة: file_url المباشر أولًا ثم download_path النسبي
-  const candidates = [
-    result.file_url, result.fileUrl, result.download_path, result.downloadPath,
-    job.file_url, job.fileUrl, job.result_url, job.resultUrl, job.download_path, job.downloadPath,
-    root.file_url, root.result_url, root.download_path,
-  ];
-  const url = toAbsoluteUrl(candidates.find((c): c is string => typeof c === "string" && !!c.trim()), MERGER_BASE);
+  // رابط النتيجة — الأهم: نفضّل المسارات النسبية مسبوقة بعنوان الخدمة العام (MERGER_BASE)
+  // لأن الحقول المطلقة من الخدمة (download_url / result.file_url) قد تشير لسيرفر داخلي
+  // غير متاح للإنترنت العام (كما جرى التحقق عمليًا مع نطاق fcapp.run الداخلي).
+  // الترتيب: download_path النسبي ← /files/{job_id}/{filename} ← أي رابط مطلق كحل أخير.
+  const jobId = pickStr(job.job_id, job.id, root.job_id, root.id);
+  const relPath =
+    pickStr(job.download_path, job.downloadPath, result.download_path, result.downloadPath, root.download_path) ?? undefined;
+  const absUrl =
+    pickStr(result.file_url, result.fileUrl, job.download_url, job.file_url, job.result_url, root.download_url, root.file_url) ??
+    undefined;
+  const filename = pickStr(result.filename, job.filename) ?? undefined;
+
+  let url: string | undefined;
+  if (relPath && relPath.trim()) {
+    url = `${MERGER_BASE}${relPath.trim().startsWith("/") ? "" : "/"}${relPath.trim()}`;
+  } else if (jobId && filename) {
+    url = `${MERGER_BASE}/files/${encodeURIComponent(jobId)}/${encodeURIComponent(filename)}`;
+  } else {
+    url = toAbsoluteUrl(absUrl, MERGER_BASE);
+  }
 
   const err =
     pickStr(job.error, root.error) ??
@@ -273,7 +286,7 @@ export async function runMerge(args: MergeArgs): Promise<MergeOutcome> {
         progress: elapsed,
         total,
         percent: Math.max(3, Math.min(95, st.progress)),
-        message: `قيد الدمج (${st.progress}%)`,
+        message: "قيد الدمج…", // النسبة تُلحق تلقائيًا بواسطة طبقة MCP
         taskId: task.id,
       });
     } catch (err) {
