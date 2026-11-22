@@ -35,6 +35,10 @@ export interface TaskRow {
   createdAt: string;
   updatedAt: string;
   completedAt: string | null;
+  /** آخر مرة ارتفع فيها التقدم فعليًا — أساس كشف «المهمة العالقة» لدى المزود */
+  progressUpdatedAt: string | null;
+  /** عدد مرات إعادة التوليد التلقائية للمهمة العالقة (نفس task_id) */
+  restarts: number;
 }
 
 function toRow(r: Record<string, unknown>): TaskRow {
@@ -65,6 +69,8 @@ function toRow(r: Record<string, unknown>): TaskRow {
     createdAt: String(r.created_at),
     updatedAt: String(r.updated_at),
     completedAt: (r.completed_at as string) ?? null,
+    progressUpdatedAt: (r.progress_updated_at as string) ?? null,
+    restarts: Number(r.restarts ?? 0),
   };
 }
 
@@ -85,8 +91,8 @@ export async function insertTask(t: {
   await ensureSchema();
   const id = randomUUID();
   await getTurso().execute({
-    sql: `INSERT INTO tasks (id, provider, provider_task_id, key_id, model, type, prompt, params_json, status, progress, result_urls_json, error_message, attempts_json)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    sql: `INSERT INTO tasks (id, provider, provider_task_id, key_id, model, type, prompt, params_json, status, progress, result_urls_json, error_message, attempts_json, progress_updated_at, restarts)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     args: [
       id,
       t.provider,
@@ -101,6 +107,9 @@ export async function insertTask(t: {
       t.resultUrls?.length ? JSON.stringify(t.resultUrls) : null,
       t.errorMessage ?? null,
       JSON.stringify(t.attempts ?? []),
+      // يبدأ عدّاد «التقدم المتحرك» من لحظة الإنشاء — أساس كشف التعليق لاحقًا
+      new Date().toISOString(),
+      0,
     ],
   });
   return (await getTask(id))!;
@@ -123,6 +132,10 @@ export async function updateTask(
     providerTaskId: string | null;
     keyId: string | null;
     appendAttempt: TaskAttempt;
+    /** عدد مرات إعادة التوليد التلقائية (قيمة مطلقة) */
+    restarts: number;
+    /** تجاوز صريح لوقت آخر ارتفاع للتقدم (ISO) */
+    progressUpdatedAt: string;
   }>
 ): Promise<TaskRow | null> {
   await ensureSchema();
@@ -137,6 +150,15 @@ export async function updateTask(
   const providerTaskId = patch.providerTaskId !== undefined ? patch.providerTaskId : current.providerTaskId;
   const keyId = patch.keyId !== undefined ? patch.keyId : current.keyId;
 
+  // عدّاد «التقدم المتحرك» — يتقدم فقط عند ارتفاع فعلي في النسبة أو مهمة مزود جديدة،
+  // أما الاستعلامات التي تعيد النسبة نفسها فلا تُعيد الضبط (حتى يعمل كشف التعليق)
+  const nowIso = new Date().toISOString();
+  let progressUpdatedAt = current.progressUpdatedAt;
+  if (patch.progressUpdatedAt !== undefined) progressUpdatedAt = patch.progressUpdatedAt;
+  else if (patch.progress !== undefined && patch.progress > current.progress) progressUpdatedAt = nowIso;
+  else if (patch.providerTaskId !== undefined && patch.providerTaskId && patch.providerTaskId !== current.providerTaskId)
+    progressUpdatedAt = nowIso;
+
   await getTurso().execute({
     sql: `UPDATE tasks SET
             provider = ?,
@@ -147,6 +169,8 @@ export async function updateTask(
             result_urls_json = ?,
             error_message = ?,
             attempts_json = ?,
+            progress_updated_at = ?,
+            restarts = ?,
             updated_at = datetime('now'),
             completed_at = CASE WHEN ? = 'completed' AND completed_at IS NULL THEN datetime('now') ELSE completed_at END
           WHERE id = ?`,
@@ -159,6 +183,8 @@ export async function updateTask(
       urls.length ? JSON.stringify(urls) : null,
       "errorMessage" in patch ? patch.errorMessage ?? null : current.errorMessage,
       JSON.stringify(attempts),
+      progressUpdatedAt,
+      patch.restarts ?? current.restarts,
       status,
       id,
     ],

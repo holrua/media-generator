@@ -92,9 +92,10 @@ export const TOOLS: ToolDef[] = [
     name: "merge_videos",
     title: "Merge videos",
     description:
-      "Concatenate several video clips into ONE final high-quality video, in the exact order given. " +
+      "Concatenate several video clips into ONE final high-quality MP4 (H.264+AAC, up to 1080p), in the exact order given. Max 10 clips. " +
       "Provide 'urls' (public direct video links — e.g. the URLs returned by generate_video) OR 'task_ids' " +
       "(task_ids of completed video tasks; their stored URLs are resolved in order — perfect right after generating multiple clips). " +
+      "NOTE: the merged file is stored on the merging service for ~24 hours only — tell the user to watch/download it promptly. " +
       "Merging is usually fast: the tool waits briefly (streaming progress), then returns a merge task_id — " +
       "call get_task with it every ~10 seconds until status is completed, then show the merged video URL and stop.",
     inputSchema: {
@@ -104,19 +105,17 @@ export const TOOLS: ToolDef[] = [
           type: "array",
           items: { type: "string" },
           minItems: 2,
-          maxItems: 20,
-          description: "Public direct video URLs (http/https) in merge order — the first clip starts the final video.",
+          maxItems: 10,
+          description: "Public direct video URLs (http/https) in merge order — the first clip starts the final video. Max 10.",
         },
         task_ids: {
           type: "array",
           items: { type: "string" },
           minItems: 2,
-          maxItems: 20,
+          maxItems: 10,
           description:
-            "Alternative to urls: task_ids of COMPLETED video generation tasks — their result URLs are merged in this order.",
+            "Alternative to urls: task_ids of COMPLETED video generation tasks — their result URLs are merged in this order. Max 10.",
         },
-        resolution: { type: "string", enum: ["480p", "720p", "1080p"], default: "1080p", description: "Output resolution of the merged video." },
-        fps: { type: "integer", minimum: 24, maximum: 60, default: 30, description: "Frames per second of the merged video." },
         wait_seconds: {
           type: "integer",
           minimum: 0,
@@ -132,7 +131,8 @@ export const TOOLS: ToolDef[] = [
     title: "Get task status",
     description:
       "Track any task by its task_id — image/video generation AND video merging (reads the shared Turso database, refreshing from the provider/service when still running). " +
-      "Poll it every ~10 seconds after generate_image / generate_video / merge_videos returns a task_id. When status is completed the result URLs are included — display them to the user and stop polling.",
+      "Poll it every ~10 seconds after generate_image / generate_video / merge_videos returns a task_id. When status is completed the result URLs are included — display them to the user and stop polling. " +
+      "Stalled generations are detected and auto-restarted by the server under the SAME task_id — keep polling for up to ~45 minutes before considering a task failed; never give up just because progress looks frozen.",
     inputSchema: {
       type: "object",
       properties: {
@@ -256,11 +256,9 @@ export async function callTool(
       };
     }
 
-    // 2) تنفيذ الدمج عبر خدمة Video Merger (بلا مفاتيح API)
+    // 2) تنفيذ الدمج عبر خدمة Video Merger v2 (بلا مفاتيح API — الناتج ثابت المواصفة)
     const outcome = await runMerge({
       urls,
-      resolution: str(args.resolution) ?? "1080p",
-      fps: clamp(args.fps, 24, 60, 30),
       waitSeconds: clamp(args.wait_seconds, 0, 240, 60),
       onProgress: ctx.sendProgress,
       signal: ctx.signal,
@@ -308,15 +306,19 @@ export async function callTool(
   return { ...text(`❌ أداة غير معروفة: ${name}. المتاح: ${TOOLS.map((t) => t.name).join(", ")}`), isError: true };
 }
 
-export const SERVER_INFO = { name: "media-generator-mcp", version: "1.1.0" } as const;
+export const SERVER_INFO = { name: "media-generator-mcp", version: "1.2.0" } as const;
 
 export const SERVER_INSTRUCTIONS =
-  "AI media generation server (kie.ai + CometAPI with automatic multi-key failover, plus video merging). " +
+  "AI media generation server (kie.ai + CometAPI with automatic sequential multi-key failover, plus video merging). " +
   "Workflow: call generate_image or generate_video. If the response contains finished URLs, show them to the user. " +
   "If it returns a task_id with status PROCESSING, call get_task with that task_id every ~10 seconds until status is completed (show the URL) or failed (explain why). " +
   "IMPORTANT: the server automatically switches API keys on any failure (exhausted balance, invalid key, rate limits) and continues the SAME task under the same task_id — " +
   "you will never encounter key/balance errors. Never stop or warn the user about keys or balances; just keep polling get_task until the result appears. " +
-  "To concatenate several finished clips into one video, call merge_videos with 'urls' (direct links) or 'task_ids' (completed video tasks, in merge order); track it with get_task the same way. " +
+  "Stalls: providers occasionally freeze a generation (progress stuck for many minutes). The server detects stalled tasks and AUTOMATICALLY regenerates them under the SAME task_id — " +
+  "progress may jump back and then continue normally. Because of this, NEVER give up and NEVER tell the user that generation failed just because progress hasn't moved: " +
+  "keep polling get_task every ~10 seconds for up to ~45 minutes before considering a task failed (it auto-restarts up to 3 times). " +
+  "To concatenate several finished clips into one video, call merge_videos with 'urls' (direct links) or 'task_ids' (completed video tasks, in merge order; max 10 clips); track it with get_task the same way. " +
+  "The merged file is stored on the merging service for ~24 hours only — tell the user to watch/download it promptly. " +
   "Use list_media to recall previously generated media from the database.";
 
 export const SUPPORTED_MODELS_TEXT = MODELS.map((m) => `${m.canonical} (${m.type})`).join(", ");

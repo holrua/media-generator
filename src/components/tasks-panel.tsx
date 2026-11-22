@@ -67,6 +67,11 @@ export function TasksPanel({ data, loading }: { data: TasksResponse | null; load
                         <Video className="size-4 shrink-0 text-violet-300" />
                       )}
                       <StatusBadge status={t.status} />
+                      {t.restarts > 0 && (
+                        <Badge variant="outline" className="border-amber-500/40 bg-amber-500/10 text-[10px] text-amber-400" title="أُعيد توليدها تلقائيًا بعد توقف المزود">
+                          ♻️ ×{t.restarts}
+                        </Badge>
+                      )}
                       <code className="truncate font-mono text-xs text-muted-foreground" dir="ltr" title={t.id}>
                         {t.id.slice(0, 8)}…
                       </code>

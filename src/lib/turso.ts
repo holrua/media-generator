@@ -70,11 +70,25 @@ export function ensureSchema(): Promise<void> {
           attempts_json TEXT NOT NULL DEFAULT '[]',
           created_at TEXT NOT NULL DEFAULT (datetime('now')),
           updated_at TEXT NOT NULL DEFAULT (datetime('now')),
-          completed_at TEXT
+          completed_at TEXT,
+          progress_updated_at TEXT,
+          restarts INTEGER NOT NULL DEFAULT 0
         );
         CREATE INDEX IF NOT EXISTS idx_tasks_created ON tasks(created_at);
         CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
       `);
+      // ترحيل قواعد البيانات الأقدم (قبل أعمدة كشف التعليق) — إضافة الأعمدة إن لم تكن موجودة
+      for (const sql of [
+        "ALTER TABLE tasks ADD COLUMN progress_updated_at TEXT",
+        "ALTER TABLE tasks ADD COLUMN restarts INTEGER NOT NULL DEFAULT 0",
+      ]) {
+        try {
+          await db.execute(sql);
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          if (!/duplicate column|already exists/i.test(msg)) throw err;
+        }
+      }
     })().catch((err) => {
       globalThis.__tursoSchemaReady = undefined;
       throw err;

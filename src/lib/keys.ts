@@ -1,6 +1,6 @@
 /**
  * إدارة مفاتيح المزودين + منطق التبديل التلقائي:
- * - Round-robin: الأقل استخدامًا أولًا (usage_count ASC، ثم ما لم يُستخدم أبدًا، ثم الأقدم)
+ * - ترتيب تسلسلي صارم: أول مفتاح أُضيف يُجرَّب أولًا ثم التالي ثم التالي (created_at ASC)
  * - تصنيف ذكي للأخطاء:
  *     401/403 أو "invalid api key"  → disabled  (مفتاح غلط — يُعطَّل تلقائيًا)
  *     402 / insufficient / quota    → exhausted (خلص الرصيد — ينتقل للتالي)
@@ -142,7 +142,8 @@ export interface KeyCandidate {
 
 /**
  * يجمع كل المفاتيح القادرة على خدمة الموديل من المزودين المعنيين
- * ويرتبها: الأقل استخدامًا أولًا (Round-robin عادل).
+ * ويرتبها ترتيبًا تسلسليًا صارمًا: أول مفتاح أُضيف يُجرَّب أولًا ثم التالي ثم التالي
+ * (created_at ASC، id ASC — كما طلب المستخدم، دون أي round-robin).
  * سياسة «لا مفتاح يتوقف»: المفاتيح تبقى في الدورة دائمًا حتى مع نفاد الرصيد —
  * الاستثناء الوحيد هو التعطيل اليدوي من الواجهة (status = 'disabled').
  */
@@ -152,10 +153,7 @@ export async function getKeyPool(providers: ProviderId[]): Promise<ApiKeyRow[]> 
   const res = await getTurso().execute({
     sql: `SELECT * FROM api_keys
           WHERE status != 'disabled' AND provider IN (${placeholders})
-          ORDER BY usage_count ASC,
-                   (last_used_at IS NULL) DESC,
-                   last_used_at ASC,
-                   created_at ASC`,
+          ORDER BY created_at ASC, id ASC`,
     args: providers,
   });
   return res.rows.map((r) => toRow(r as unknown as Record<string, unknown>));

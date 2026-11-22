@@ -63,7 +63,9 @@ CREATE TABLE IF NOT EXISTS tasks (
   attempts_json TEXT DEFAULT '[]',    -- سجل كل المحاولات: {provider,keyId,keyLabel,ok,errorClass,error,at}
   created_at TEXT DEFAULT (datetime('now')),
   updated_at TEXT DEFAULT (datetime('now')),
-  completed_at TEXT
+  completed_at TEXT,
+  progress_updated_at TEXT,          -- آخر ارتفاع فعلي للتقدم (أساس كشف التعليق)
+  restarts INTEGER DEFAULT 0          -- مرات إعادة التوليد التلقائية
 );
 
 CREATE TABLE IF NOT EXISTS api_keys (
@@ -199,6 +201,7 @@ GET https://api.kie.ai/api/v1/jobs/recordInfo?taskId=<id>
 5. أثناء نافذة الانتظار `wait_seconds` (0–240 ثانية؛ الافتراضي 90 للصور و25 للفيديو): استعلم `checkTask` كل 3 ثوانٍ وأرسل **progress notifications** (~كل 3 ثوانٍ، رسالة عربية مثل «قيد التوليد… 45%» مع `progress/total/percent`).
 6. اكتمل → خزّن `result_urls_json` والحالة `completed` و progress=100 و return للمهمة المكتملة. فشل حقيقي (انتهاك سياسة/معطيات) → `failed`. فشل مفتاح/رصيد → أعد الإنشاء على المفتاح التالي بنفس `task_id` (قسم 4.3.2).
 7. انتهت النافذة والنتيجة لم تظهر → أعد المهمة بحالة `processing` مع `task_id` والعميل يتابع بـ `get_task`.
+8. **كشف التعليق وإعادة التوليد التلقائي:** عمودا `progress_updated_at` (آخر ارتفاع فعلي للتقدم) و `restarts` في جدول `tasks`. إذا بقيت المهمة `processing` بتقدم لا يتحرك إطلاقًا لمدة **10 دقائق** (`STALL_AFTER_MS`) عند `get_task` → أعد إنشاء مهمة المزود من جديد **بنفس task_id** على المفاتيح بالترتيب التسلسلي (المفتاح الحالي أولًا)، وصفّر التقدم، وسجّل محاولة بتصنيف `stalled`، وزد `restarts`. الحد الأقصى **3 إعادات** (`MAX_AUTO_RESTARTS`) مع فترة تهدئة **45 ثانية** بين المحاولات؛ وبعد استنفادها تفشل المهمة برسالة عربية واضحة تدعو لإعادة المحاولة. المهام المتزامنة (`sync-*`) ومهام الدمج مستثناة — لكل منها مسارها.
 
 `get_task` يستدعي `refreshTask(taskId)`: المهمة الجارية تُحدَّث حية من المزود (أو من خدمة الدمج)، مع نفس منطق إعادة المحاولة/التبديل أعلاه، ثم تُرجَع صياغة عربية جاهزة للعرض.
 
@@ -269,7 +272,7 @@ GET  /api/config           → حدود الخدمة الحالية (تُستخ�
 AI media generation server (kie.ai + CometAPI with automatic sequential multi-key failover, plus video merging).
 Workflow: call generate_image or generate_video. If the response contains finished URLs, show them to the user.
 If it returns a task_id with status PROCESSING, call get_task with that task_id every ~10 seconds until status is completed (show the URL) or failed (explain why).
-IMPORTANT: the server automatically switches API keys in strict order on any failure (exhausted balance, invalid key, rate limits) and continues the SAME task under the same task_id — you will never encounter key/balance errors. Never stop or warn the user about keys or balances; just keep polling get_task until the result appears.
+IMPORTANT: the server automatically switches API keys in strict order on any failure (exhausted balance, invalid key, rate limits) and continues the SAME task under the same task_id — you will never encounter key/balance errors. Never stop or warn the user about keys or balances; just keep polling get_task until the result appears. Stalls: providers occasionally freeze a generation (progress stuck for many minutes). The server detects stalled tasks and AUTOMATICALLY regenerates them under the SAME task_id — progress may jump back and then continue normally. Because of this, NEVER give up and NEVER tell the user that generation failed just because progress hasn't moved: keep polling get_task every ~10 seconds for up to ~45 minutes before considering a task failed (it auto-restarts up to 3 times).
 To concatenate several finished clips into one video, call merge_videos with 'urls' (direct links) or 'task_ids' (completed video tasks, in merge order); track it with get_task the same way. Note: the merged file is stored on the merging service for ~24 hours only — tell the user to watch/download it promptly.
 Use list_media to recall previously generated media from the database.
 ```

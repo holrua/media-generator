@@ -24,9 +24,9 @@ async function main() {
   });
   console.log("2) task_ids غير موجودة → isError:", badIds.isError, "|", (badIds.content as Array<{ text: string }>)[0].text.split("\n").slice(0, 4).join(" | ").slice(0, 220));
 
-  // 3) مسار الفشل الشبكي: روابط صالحة شكلًا → مهمة تُسجَّل في Turso ثم تفشل بخطأ واضح
+  // 3) مسار الفشل الشبكي: روابط صالحة شكلًا → مهمة تُسجَّل في Turso ثم تتبعها الخدمة فعليًا
   const attempt = await client.callTool(
-    { name: "merge_videos", arguments: { urls: ["https://example.com/clip1.mp4", "https://example.com/clip2.mp4"], resolution: "720p", fps: 30, wait_seconds: 4 } },
+    { name: "merge_videos", arguments: { urls: ["https://example.com/clip1.mp4", "https://example.com/clip2.mp4"], wait_seconds: 4 } },
     undefined,
     { timeout: 90_000 }
   );

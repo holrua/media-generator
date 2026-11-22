@@ -7,6 +7,9 @@
  *   المتابعة حتى ظهور النتيجة دون أن يعلم بحدوث أي تبديل.
  * - مهمة فشل إنشاؤها على كل المفاتيح تبقى «قيد المعالجة» وتُعاد محاولتها تلقائيًا
  *   مع كل استعلام get_task — فعند شحن رصيد أي مفتاح تكتمل المهمة من تلقاء نفسها.
+ * - المهمة العالقة لدى المزود (تقدم مجمد عند نسبة لا تتغير ~10 دقائق) تُعاد توليدها
+ *   تلقائيًا بنفس task_id حتى MAX_AUTO_RESTARTS مرات — علشان العميل ما يتعطلش أبديًا؛
+ *   وبعد استنفاد المحاولات تفشل برسالة واضحة تدعو لإعادة المحاولة.
  * - أخطاء المعطيات (params) فقط تتوقف فورًا لأن تبديل المفاتيح لن يحلها.
  * أثناء الانتظار يرسل Progress notifications للعميل عبر onProgress.
  */
@@ -72,6 +75,13 @@ const POLL_INTERVAL_MS = 3_000;
 const RESTART_COOLDOWN_MS = 45_000;
 /** أنماط تشير لمشكلة مفتاح/رصيد حتى لو وردت داخل رسالة فشل المهمة نفسها */
 const KEY_ISSUE_PATTERN = /insufficient|balance|credit|quota|arrears|充值|out of credits|exhausted|resource.?exhausted|invalid.{0,20}key|unauthorized|forbidden|402|401/i;
+
+/** مدة اعتبار المهمة «عالقة» لدى المزود: تقدم لا يتحرك إطلاقًا خلال 10 دقائق */
+export const STALL_AFTER_MS = 10 * 60_000;
+/** أقصى عدد مرات لإعادة التوليد التلقائية للمهمة العالقة (نفس task_id) */
+export const MAX_AUTO_RESTARTS = 3;
+/** فترة تهدئة بين محاولات إعادة التوليد التلقائية (حتى لا نضغط المزود) */
+export const STALL_RETRY_COOLDOWN_MS = 45_000;
 
 function estimateTotalSeconds(type: MediaType, duration?: number): number {
   if (type === "image") return 60;
@@ -167,8 +177,14 @@ type RestartResult =
 /**
  * قلب سياسة «لا مفتاح يتوقف»: إعادة إنشاء نفس المهمة على المفتاح التالي
  * بنفس صف المهمة في Turso (نفس task_id أمام العميل) دون أي انقطاع.
+ * okNote: تعليق اختياري يُسجَّل مع محاولة النجاح (مثل سبب إعادة التوليد التلقائية).
  */
-async function restartOnNextKey(task: TaskRow, currentKeyId: string | null, ctx: RunCtx): Promise<RestartResult> {
+async function restartOnNextKey(
+  task: TaskRow,
+  currentKeyId: string | null,
+  ctx: RunCtx,
+  okNote?: { errorClass?: string; error?: string }
+): Promise<RestartResult> {
   const remaining = ctx.pool.filter((k) => k.id !== currentKeyId && !ctx.usedKeyIds.has(k.id));
   if (remaining.length === 0) return { kind: "exhausted_pool" };
 
@@ -221,7 +237,14 @@ async function restartOnNextKey(task: TaskRow, currentKeyId: string | null, ctx:
         status: "processing",
         progress: 5,
         errorMessage: null,
-        appendAttempt: { provider: key.provider, keyId: key.id, keyLabel: label, ok: true, at: new Date().toISOString() },
+        appendAttempt: {
+          provider: key.provider,
+          keyId: key.id,
+          keyLabel: label,
+          ok: true,
+          ...(okNote ? { errorClass: okNote.errorClass, error: okNote.error } : {}),
+          at: new Date().toISOString(),
+        },
       });
       await ctx.args.onProgress?.({
         progress: 0,
@@ -390,7 +413,7 @@ export async function runGeneration(args: GenerationArgs): Promise<GenerationOut
     return { kind: "invalid", reason: "وصف الفيديو يجب أن يكون 4096 حرفًا كحد أقصى" };
   }
 
-  // 2) تجميع كل المفاتيح (لا مفتاح يتوقف) — الأقل استخدامًا أولًا
+  // 2) تجميع كل المفاتيح (لا مفتاح يتوقف) — بترتيب الإضافة التسلسلي: أول مفتاح ثم التالي ثم التالي
   const pool = await getKeyPool(def.providers);
   if (pool.length === 0) {
     return { kind: "no_keys", model: def.canonical };
@@ -529,8 +552,100 @@ export async function runGeneration(args: GenerationArgs): Promise<GenerationOut
   return { kind: "processing", task: waiting };
 }
 
+/** وقت آخر محاولة مسجّلة (إنشاء/تبديل/إعادة) — أساس فترات التهدئة */
+function lastAttemptAt(task: TaskRow): number {
+  for (let i = task.attempts.length - 1; i >= 0; i--) {
+    const t = Date.parse(task.attempts[i].at);
+    if (Number.isFinite(t)) return t;
+  }
+  return 0;
+}
+
+/**
+ * هل المهمة عالقة لدى المزود؟
+ * المعيار: processing + مهمة مزود حقيقية (غير متزامنة) + التقدم لم يرتفع إطلاقًا
+ * خلال STALL_AFTER_MS منذ آخر ارتفاع (progress_updated_at).
+ * المهام المتزامنة (sync-*) ومهام الدمج (merger) مستثناة — لكل منها مسارها.
+ */
+export function isStalled(task: TaskRow, now = Date.now()): boolean {
+  if (task.status !== "processing") return false;
+  if (task.provider === "merger" || !task.provider || !task.providerTaskId) return false;
+  if (task.providerTaskId.startsWith("sync-")) return false;
+  if (!task.progressUpdatedAt) return false;
+  const t = Date.parse(task.progressUpdatedAt);
+  if (!Number.isFinite(t)) return false;
+  return now - t >= STALL_AFTER_MS;
+}
+
+/**
+ * إعادة توليد مهمة عالقة لدى المزود (التقدم مجمد عند نسبة لا تتغير ~10 دقائق) بنفس task_id:
+ * - تُنشأ مهمة مزود جديدة على المفاتيح بالترتيب التسلسلي (المفتاح الحالي أولًا — فالمشكلة
+ *   في المهمة نفسها لا في المفتاح غالبًا)، ويقفز التقدم للخلف ثم يكمل طبيعيًا.
+ * - حتى MAX_AUTO_RESTARTS مرات مع فترة تهدئة بين المحاولات؛ العميل يرى «قيد المعالجة» فقط.
+ * - بعد استنفاد المحاولات نُفشل المهمة برسالة واضحة بدل تعليقها للأبد.
+ */
+async function restartStalledTask(task: TaskRow, signal?: AbortSignal): Promise<TaskRow> {
+  // تهدئة بين المحاولات — آخر محاولة مسجلة (نجاح أو فشل) تحدّد الإيقاع
+  if (Date.now() - lastAttemptAt(task) < STALL_RETRY_COOLDOWN_MS) return task;
+
+  if (task.restarts >= MAX_AUTO_RESTARTS) {
+    return (
+      (await updateTask(task.id, {
+        status: "failed",
+        progress: 100,
+        errorMessage:
+          `توقف توليد هذا الطلب لدى المزود مرارًا دون أي تقدم — أُعيد التوليد تلقائيًا ${task.restarts} مرات ` +
+          `وبقي معلقًا ~10 دقائق في كل محاولة. أعد المحاولة بعد قليل (غالبًا ستنجح) أو جرّب صياغة مختلفة للوصف.`,
+      })) ?? task
+    );
+  }
+
+  const def = findModel(task.model);
+  if (!def) {
+    return (await updateTask(task.id, { status: "failed", progress: 100, errorMessage: `موديل غير معروف: ${task.model}` })) ?? task;
+  }
+
+  const attemptNo = task.restarts + 1;
+  const pool = await getKeyPool(def.providers);
+  if (pool.length === 0) {
+    // لا مفاتيح متاحة الآن — تبقى المهمة قيد المعالجة وتُعاد المحاولة مع الاستعلامات القادمة
+    return task;
+  }
+  const ctx: RunCtx = {
+    def,
+    args: argsFromTask(task, signal),
+    pool,
+    usedKeyIds: new Set<string>(),
+    attempts: task.attempts,
+  };
+  const restart = await restartOnNextKey(task, null, ctx, {
+    errorClass: "stalled",
+    error: `توقف التوليد لدى المزود دون تقدم ~10 دقائق — إعادة توليد تلقائية #${attemptNo}`,
+  });
+  switch (restart.kind) {
+    case "switched":
+    case "completed":
+      return (await updateTask(task.id, { restarts: attemptNo })) ?? restart.task;
+    case "failed":
+      return restart.task;
+    case "exhausted_pool":
+      // فشل الإنشاء على كل المفاتيح أو ضغط مؤقت — تبقى قيد المعالجة وتُعاد المحاولة بعد التهدئة
+      return (
+        (await updateTask(task.id, {
+          errorMessage: "تعذّرت إعادة التوليد التلقائية الآن (ضغط مؤقت أو لا مفتاح مقبول) — تُعاد المحاولة تلقائيًا",
+        })) ?? task
+      );
+  }
+}
+
 /** إعادة إنشاء مهمة معلّقة (بلا providerTaskId) على المفاتيح المتاحة — مع كل استعلام get_task */
 async function retryWaitingTask(task: TaskRow, signal?: AbortSignal): Promise<TaskRow> {
+  // تهدئة بين المحاولات حتى لا نضغط المزودين مع الاستعلامات المتقاربة
+  if (task.attempts.length && Date.now() - lastAttemptAt(task) < RESTART_COOLDOWN_MS) {
+    return (await updateTask(task.id, {
+      errorMessage: "بانتظار توفر مفتاح صالح — السيرفر يعيد المحاولة تلقائيًا مع كل استعلام للمتابعة",
+    })) ?? task;
+  }
   const def = findModel(task.model);
   if (!def) {
     return (await updateTask(task.id, { status: "failed", progress: 100, errorMessage: `موديل غير معروف: ${task.model}` })) ?? task;
@@ -646,6 +761,17 @@ export async function refreshTask(taskId: string, signal?: AbortSignal): Promise
     return retryWaitingTask(task, signal);
   }
 
+  // صفوف أقدم من ترحيل أعمدة كشف التعليق — ابدأ عدّاد «التقدم المتحرك» من الآن
+  if (!task.progressUpdatedAt) {
+    await safe(() => updateTask(task.id, { progressUpdatedAt: new Date().toISOString() }));
+  }
+
+  // مهمة عالقة لدى المزود (التقدم مجمد عند نسبة لا تتغير ~10 دقائق) → إعادة توليد تلقائية
+  // بنفس task_id — العميل يرى «قيد المعالجة» فقط ويكمل المتابعة حتى النتيجة.
+  if (isStalled(task)) {
+    return restartStalledTask(task, signal);
+  }
+
   const key = task.keyId ? await getKey(task.keyId) : null;
   if (!key) {
     // المفتاح المستخدم حُذف يدويًا → أنشئ المهمة من جديد على مفتاح آخر بنفس task_id
@@ -711,7 +837,15 @@ export function renderTaskForClient(task: TaskRow, opts: { forTool?: "get_task" 
   // pending / processing
   lines.push(`⏳ ${labelEn} task is ${task.status.toUpperCase()} (task_id: ${task.id})`);
   lines.push(`model: ${task.model} — progress: ${task.progress}%`);
-  lines.push(`ℹ️ The server automatically switches API keys on any failure (balance/invalid/rate-limit) and continues the SAME task — you will never see a key or balance error. Just keep polling.`);
+  if (task.restarts > 0) {
+    lines.push(
+      `♻️ The provider stalled earlier — the server already auto-restarted this generation ${task.restarts} time(s) under the SAME task_id. Keep polling normally.`
+    );
+  }
+  lines.push(
+    `ℹ️ The server automatically switches API keys on any failure (balance/invalid/rate-limit) and continues the SAME task — you will never see a key or balance error. ` +
+      `If progress ever looks frozen, the server detects the stall and regenerates automatically — NEVER give up and NEVER report failure just because progress hasn't moved for a few minutes.`
+  );
   lines.push(`➡️ Call get_task with task_id="${task.id}" every ~10 seconds until status becomes "completed", then show the result URL to the user and stop polling.`);
   return lines.join("\n");
 }

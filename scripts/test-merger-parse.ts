@@ -1,7 +1,10 @@
 /**
- * اختبار وحدة لمحلل استجابات خدمة الدمج (parseJobStatus / extractJobId)
+ * اختبار وحدة لمحلل استجابات خدمة الدمج v2 (parseJobStatus / extractJobId)
  * يُشغَّل: bun scripts/test-merger-parse.ts
- * يغطي الصيغ المحتملة للحقول (job_id|id، progress كسري|مئوي، file_url مطلق|download_path نسبي…)
+ * يغطي الأشكال الحقيقية المقاسة للخدمة (dmg1.vercel.app):
+ *   POST /api/jobs → {jobId, status:"queued", statusUrl, processUrl, expiresAt}
+ *   GET  /api/jobs/{id} → {status:"queued|done|failed", progress, videoUrl, downloadUrl, error}
+ *   مع الصيغ الدفاعية (job_id|id، progress كسري، error بلا status، روابط نسبية…)
  */
 import { parseJobStatus, extractJobId, MERGER_BASE, type MergeJobStatus } from "../src/lib/merger";
 
@@ -31,120 +34,91 @@ function expectStatus(name: string, data: unknown, want: Partial<MergeJobStatus>
 }
 
 console.log("1) extractJobId — صيغ مختلفة:");
-check("job_id عادي", extractJobId({ job_id: "abc-123" }) === "abc-123");
+check("jobId الموثق v2", extractJobId({ jobId: "wkucdefoxwvd", status: "queued" }) === "wkucdefoxwvd");
+check("job_id بديل", extractJobId({ job_id: "abc-123" }) === "abc-123");
 check("id بديل", extractJobId({ id: "xyz" }) === "xyz");
-check("متداخل داخل job", extractJobId({ job: { job_id: "nested" } }) === "nested");
+check("متداخل داخل job", extractJobId({ job: { jobId: "nested" } }) === "nested");
 check("نص مجرد", extractJobId("plain-id") === "plain-id");
 check("فارغ → undefined", extractJobId({}) === undefined);
 
-console.log("2) parseJobStatus — المثال الموثق (status=done + download_path نسبي):");
-expectStatus("done + مسار نسبي", { status: "done", progress: 100, download_path: `/api/jobs/j1/download` }, {
-  status: "completed",
-  progress: 100,
-  resultUrls: [`${MERGER_BASE}/api/jobs/j1/download`],
-});
+console.log("2) الاستجابة الموثقة عند الإنشاء (queued):");
+expectStatus("queued 0", { status: "queued", progress: 0 }, { status: "processing", progress: 0, resultUrls: [] });
 
-console.log("3) parseJobStatus — result.file_url مطلق:");
+console.log("3) الاستجابة الموثقة عند الاكتمال (status=done + videoUrl/downloadUrl):");
 expectStatus(
-  "file_url مطلق",
-  { status: "done", progress: 1.0, result: { file_url: "https://cdn.example.com/files/j2/out.mp4", filename: "out.mp4" } },
-  { status: "completed", progress: 100, resultUrls: ["https://cdn.example.com/files/j2/out.mp4"] }
-);
-
-console.log("4) parseJobStatus — تقدم كسري 0..1 أثناء المعالجة:");
-expectStatus("processing 0.45", { status: "running", progress: 0.45 }, { status: "processing", progress: 45 });
-expectStatus("processing مئوي 62", { status: "processing", progress: 62 }, { status: "processing", progress: 62 });
-expectStatus("بدون progress", { status: "queued" }, { status: "processing", progress: 0 });
-
-console.log("5) parseJobStatus — فشل مع رسالة:");
-expectStatus("error + detail", { status: "error", detail: "ffprobe failed: bad container" }, {
-  status: "failed",
-  error: "ffprobe failed",
-});
-
-console.log("6) parseJobStatus — صيغ بديلة (state، result.download_path):");
-expectStatus("state=finished", { state: "finished", result: { download_path: "/api/jobs/j3/download" } }, {
-  status: "completed",
-  resultUrls: [`${MERGER_BASE}/api/jobs/j3/download`],
-});
-expectStatus("file_url نسبي داخل result", { status: "done", result: { file_url: "/files/j4/out.mp4" } }, {
-  status: "completed",
-  resultUrls: [`${MERGER_BASE}/files/j4/out.mp4`],
-});
-
-console.log("7) parseJobStatus — حقل داخل job متداخل:");
-expectStatus("nested job", { job: { status: "done", progress: 100, download_path: "/api/jobs/j5/download" } }, {
-  status: "completed",
-  progress: 100,
-});
-
-console.log("8) الاستجابة الحقيقية الملتقطة من الخدمة (done + روابط داخلية يجب تجاهلها):");
-const REAL_DONE = {
-  job_id: "6d11de90ac81",
-  status: "done",
-  stage_ar: "اكتمال الدمج بنجاح",
-  progress: 100,
-  resolution: "480p",
-  fps: 30,
-  created_at: 1793990909.0266018,
-  items: [
-    { index: 0, type: "url", source: "https://www.w3schools.com/html/mov_bbb.mp4", status: "ok", error: null },
-    { index: 1, type: "url", source: "https://www.w3schools.com/html/movie.mp4", status: "ok", error: null },
-  ],
-  download_path: "/api/jobs/6d11de90ac81/download",
-  download_url: "http://ws-babffe-fddac-jurllaczyt.cn-hongkong-vpc.fcapp.run/api/jobs/6d11de90ac81/download",
-  stream_url: "http://ws-babffe-fddac-jurllaczyt.cn-hongkong-vpc.fcapp.run/api/jobs/6d11de90ac81/download?inline=1",
-  error: null,
-  result: {
-    filename: "merged_6d11de90.mp4",
-    size_bytes: 4578505,
-    duration: 22.63,
-    width: 854,
-    height: 480,
-    fps: 30,
-    video_codec: "h264",
-    audio_codec: "aac",
-    file_url: "http://ws-babffe-fddac-jurllaczyt.cn-hongkong-vpc.fcapp.run/files/6d11de90ac81/merged_6d11de90.mp4",
+  "done + videoUrl مطلق",
+  {
+    status: "done",
+    progress: 100,
+    videoUrl: `${MERGER_BASE}/api/jobs/j1/video`,
+    downloadUrl: `${MERGER_BASE}/api/jobs/j1/video?download=1`,
+    size: 1234567,
+    duration: 30.2,
+    resolution: "640x360",
   },
-};
-expectStatus("الاستجابة الحقيقية → download_path عبر النطاق العام", REAL_DONE, {
-  status: "completed",
-  progress: 100,
-  resultUrls: [`${MERGER_BASE}/api/jobs/6d11de90ac81/download`],
-});
+  { status: "completed", progress: 100, resultUrls: [`${MERGER_BASE}/api/jobs/j1/video`] }
+);
 {
-  const got = parseJobStatus(REAL_DONE);
-  check(
-    "لا يستخدم السيرفر الداخلي fcapp.run إطلاقًا",
-    !got.resultUrls.some((u) => u.includes("fcapp.run")),
-    got.resultUrls.join(",")
-  );
+  // downloadUrl له الأولوية الثانية — videoUrl أولًا
+  const got = parseJobStatus({
+    status: "done",
+    videoUrl: `${MERGER_BASE}/api/jobs/j2/video`,
+    downloadUrl: "https://cdn.example.com/alt.mp4",
+  });
+  check("videoUrl له الأولوية على downloadUrl", got.resultUrls[0] === `${MERGER_BASE}/api/jobs/j2/video`, got.resultUrls.join(","));
 }
 
-console.log("9) الاستجابة الحقيقية قيد المعالجة (progress كسري + status=queued):");
+console.log("4) done بلا روابط صريحة → الرابط الاحتياطي /api/jobs/{id}/video:");
 expectStatus(
-  "queued 0.0",
-  { ...REAL_DONE, status: "queued", progress: 0.0, download_url: null, stream_url: null, result: null },
-  { status: "processing", progress: 0, resultUrls: [] }
+  "done + jobId فقط",
+  { job_id: "j3", status: "done", progress: 100 },
+  { status: "completed", progress: 100, resultUrls: [`${MERGER_BASE}/api/jobs/j3/video`] }
 );
-expectStatus("processing 0.45 كسري", { ...REAL_DONE, status: "processing", progress: 0.45, download_url: null, result: null }, {
-  status: "processing",
-  progress: 45,
+
+console.log("5) التقدم الكسري 0..1 وأثناء المعالجة:");
+expectStatus("processing 0.45 كسري", { status: "processing", progress: 0.45 }, { status: "processing", progress: 45 });
+expectStatus("processing مئوي 62", { status: "processing", progress: 62 }, { status: "processing", progress: 62 });
+expectStatus("بدون progress", { status: "queued" }, { status: "processing", progress: 0 });
+check("الكسر الصغير 0.5 لا يُقبل إلا كسرًا", parseJobStatus({ status: "processing", progress: 50 }).progress === 50);
+
+console.log("6) الفشل الحقيقي من خطوة process (HTTP 500 يُفكَّك قبل المرور هنا كـ error):");
+expectStatus(
+  "error + رسالة التحميل",
+  { status: "failed", error: "Download failed (HTTP 403)" },
+  { status: "failed", progress: 100, error: "Download failed" }
+);
+expectStatus(
+  "error بلا status → فشل فورًا (موثق من الخدمة)",
+  { error: "Download failed (HTTP 403)" },
+  { status: "failed", error: "Download failed" }
+);
+expectStatus(
+  "detail بدل error",
+  { detail: "ffprobe failed: bad container" },
+  { status: "failed", error: "ffprobe failed" }
+);
+
+console.log("7) صيغ بديلة (state بدل status، nesting داخل job/data):");
+expectStatus("state=finished", { state: "finished", videoUrl: `${MERGER_BASE}/api/jobs/j4/video` }, {
+  status: "completed",
+  resultUrls: [`${MERGER_BASE}/api/jobs/j4/video`],
+});
+expectStatus("nested job", { job: { status: "done", progress: 100, jobId: "j5" } }, {
+  status: "completed",
+  progress: 100,
+  resultUrls: [`${MERGER_BASE}/api/jobs/j5/video`],
+});
+expectStatus("nested data", { data: { status: "done", progress: 100, jobId: "j6" } }, {
+  status: "completed",
+  progress: 100,
 });
 
-console.log("10) فشل حقيقي: أحد العناصر error والحالة error:");
-expectStatus(
-  "error مع items فاشلة",
-  { ...REAL_DONE, status: "error", progress: 40, error: "ffmpeg exited with code 1: Invalid data", download_url: null, result: null },
-  { status: "failed", error: "ffmpeg exited" }
-);
-
-console.log("11) لا download_path بل filename فقط → /files/{job_id}/{filename}:");
-expectStatus(
-  "filename fallback",
-  { job_id: "j7", status: "done", download_path: null, download_url: null, result: { filename: "out.mp4" } },
-  { status: "completed", resultUrls: [`${MERGER_BASE}/files/j7/out.mp4`] }
-);
+console.log("8) فشل مع progress جزئي → تثبيت 100:");
+expectStatus("failed عند 40", { status: "failed", progress: 40, error: "ffmpeg exited with code 1" }, {
+  status: "failed",
+  progress: 100,
+  error: "ffmpeg exited",
+});
 
 console.log(`\nالنتيجة: ${passed} نجح / ${failed} فشل`);
 if (failed > 0) process.exit(1);

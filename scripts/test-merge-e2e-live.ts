@@ -7,6 +7,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 
 const MCP_URL = process.env.MCP_TEST_URL || "http://localhost:3000/mcp";
+const MERGER_BASE = (process.env.MERGER_API_BASE || "https://dmg1.vercel.app").replace(/\/+$/, "");
 const CLIP1 = "https://www.w3schools.com/html/mov_bbb.mp4";
 const CLIP2 = "https://www.w3schools.com/html/movie.mp4";
 
@@ -20,7 +21,7 @@ async function main() {
   const res = await client.callTool(
     {
       name: "merge_videos",
-      arguments: { urls: [CLIP1, CLIP2], resolution: "480p", fps: 30, wait_seconds: 120 },
+      arguments: { urls: [CLIP1, CLIP2], wait_seconds: 120 },
     },
     undefined,
     { onprogress: (p) => console.log(`   PROGRESS: ${JSON.stringify(p)}`), timeout: 180_000 }
@@ -37,7 +38,7 @@ async function main() {
   const url = urlMatch[1];
   console.log("3) الرابط النهائي:", url);
   if (url.includes("fcapp.run")) throw new Error("الرابط يشير للسيرفر الداخلي!");
-  if (!url.includes("space-z.ai")) throw new Error("الرابط ليس عبر النطاق العام");
+  if (!url.startsWith(MERGER_BASE)) throw new Error(`الرابط ليس عبر نطاق الخدمة (${MERGER_BASE})`);
 
   // البوابة ترفض HEAD — نستخدم GET مع Range لجلب أول 1KB والتحقق من MP4 صالح
   const head = await fetch(url, { headers: { Range: "bytes=0-1023" }, signal: AbortSignal.timeout(30_000) });

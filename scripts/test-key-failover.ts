@@ -67,7 +67,7 @@ async function main() {
 
     // 5) التحقق من سجل المحاولات في قاعدة البيانات (وهمي فاشل + حقيقي ناجح)
     const tasks = (await (await fetch(`${API}/tasks?limit=3`)).json()) as {
-      tasks: Array<{ id: string; status: string; attempts: Array<{ keyLabel: string; ok: boolean }> }>;
+      tasks: Array<{ id: string; status: string; attempts: Array<{ keyLabel: string; ok: boolean; errorClass?: string }> }>;
     };
     const t = tasks.tasks[0];
     console.log("5) آخر مهمة:", t.id.slice(0, 8), "— الحالة:", t.status, "— المحاولات:", t.attempts.map((a) => `${a.keyLabel}:${a.ok ? "ok" : "fail"}`).join(" → "));

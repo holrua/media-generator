@@ -49,6 +49,7 @@ export interface TaskItem {
   createdAt: string;
   updatedAt: string;
   completedAt: string | null;
+  restarts: number;
 }
 
 export interface TasksResponse {
